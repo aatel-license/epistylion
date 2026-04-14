@@ -1,0 +1,27 @@
+{
+  "mcpServers": {
+    "server-name": {
+      "command": "comando",
+      "args": [
+        "argomento1",
+        "argomento2"
+      ],
+      "env": {
+        "CHIAVE_AMBIENTE": "valore"
+      }
+    },
+    "blender": {
+      "command": "uvx",
+      "args": [
+        "blender-mcp"
+      ]
+    },
+    "web-search": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-fetch"
+      ]
+    }
+  }
+}
