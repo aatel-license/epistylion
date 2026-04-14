@@ -156,17 +156,17 @@ async def example_with_monitoring():
     def on_step(step: int, tool_name: str, result: str) -> None:
         print(f"  → Step {step}: {tool_name}({result[:80]}...)")
 
-    bridge = MCPBridge.from_config("mcp_servers.json")
-    await epistylion.connect(on_step=on_step)
+    _epistylion = MCPBridge.from_config("mcp_servers.json")
+    await _epistylion.connect(on_step=on_step)
 
     try:
         result = await retry_with_backoff(
-            epistylion.agent.run,
+            _epistylion.agent.run,
             "Cerca le ultime notizie su LLM locali"
         )
         print(result.final_message)
     finally:
-        await epistylion.disconnect()
+        await _epistylion.disconnect()
 
 
 # ────────────────────────────────────────────────────────────────────────────
