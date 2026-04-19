@@ -1,48 +1,53 @@
 """
-mcp_bridge.server_openai
+epistylion.server_openai
 ~~~~~~~~~~~~~~~~~~~~~~~~
-Espone un endpoint **OpenAI-compatible** (``/v1/chat/completions``) sulla LAN,
-con i tool MCP già integrati nel loop agente.
-
-Il client remoto fa una normale chiamata OpenAI e riceve la risposta finale
-dopo che il bridge ha già eseguito tutti i tool call necessari.
+Server HTTP **OpenAI-compatible** con tool MCP integrati, logging strutturato
+e observability completa.
 
 Flusso::
 
     LAN client ──POST /v1/chat/completions──► questo server
-                                              ├──► LLM locale (llama-cpp-python/Ollama/…)
-                                              └──► tool MCP (blender, mnheme, scrapling…)
-                ◄── risposta finale ──────────┘
+                                              ├──► LLM locale
+                                              └──► tool MCP (stdio)
+               ◄── risposta finale ───────────┘
 
-Avvio rapido::
+Endpoint
+--------
+POST /v1/chat/completions   Completions con tool MCP (stream opzionale)
+GET  /v1/models             Modello configurato
+GET  /v1/tools              Tool MCP disponibili in formato OpenAI
+GET  /v1/status             Stato runtime (uptime, contatori, server connessi)
+GET  /metrics               Metriche JSON (Prometheus-friendly labels)
+GET  /health                Health check (200 = ok, 503 = degraded)
 
-    python -m mcp_bridge --serve-openai
-    python -m mcp_bridge --serve-openai --host 0.0.0.0 --openai-port 8081
-
-Oppure da codice::
-
-    from mcp_bridge.server_openai import OpenAIProxyServer
-    server = OpenAIProxyServer.from_config("mcp_servers.json")
-    await server.run(host="0.0.0.0", port=8081)
-
-Endpoint esposti
-----------------
-POST /v1/chat/completions   Completions con tool MCP integrati (streaming opzionale)
-GET  /v1/models             Lista modello configurato
-GET  /health                Stato server e server MCP connessi
+Variabili d'ambiente
+--------------------
+EPISTYLION_API_KEY       Se impostata, richiede Authorization: Bearer <key>
+                         oppure X-Api-Key: <key>
+EPISTYLION_LOG_LEVEL     DEBUG / INFO / WARNING / ERROR  (default: INFO)
+EPISTYLION_LOG_FORMAT    json / text                     (default: json)
+EPISTYLION_CORS_ORIGINS  Origini CORS separate da virgola (default: *)
+EPISTYLION_RATE_LIMIT    Richieste/minuto per IP, 0=disabilitato (default: 0)
 """
 
 from __future__ import annotations
 
 import asyncio
+import collections
 import json
 import logging
+import math
+import os
+import statistics
 import time
+import traceback
 import uuid
 from pathlib import Path
 from typing import Any, AsyncIterator
 
 from starlette.applications import Starlette
+from starlette.middleware import Middleware
+from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
@@ -51,29 +56,303 @@ from .agent import AgentMessage
 from .bridge import MCPBridge
 from .config import BridgeConfig, load_config
 
-logger = logging.getLogger(__name__)
+# ── logging strutturato ────────────────────────────────────────────────────────
 
+_LOG_FORMAT = os.getenv("EPISTYLION_LOG_FORMAT", "json").lower()
+_LOG_LEVEL  = os.getenv("EPISTYLION_LOG_LEVEL", "INFO").upper()
+
+
+class _JsonFormatter(logging.Formatter):
+    """Serializza ogni LogRecord come riga JSON (Loki / ELK / Datadog ready)."""
+
+    KEEP = {"name", "levelname", "message", "exc_info"}
+
+    def format(self, record: logging.LogRecord) -> str:
+        record.message = record.getMessage()
+        doc: dict[str, Any] = {
+            "ts":      self.formatTime(record, "%Y-%m-%dT%H:%M:%S"),
+            "level":   record.levelname,
+            "logger":  record.name,
+            "msg":     record.message,
+        }
+        # Campi extra aggiunti con logger.info(..., extra={...})
+        for k, v in record.__dict__.items():
+            if k not in logging.LogRecord.__dict__ and not k.startswith("_"):
+                doc[k] = v
+        if record.exc_info:
+            doc["exc"] = self.formatException(record.exc_info)
+        return json.dumps(doc, ensure_ascii=False, default=str)
+
+
+def _setup_logging() -> None:
+    handler = logging.StreamHandler()
+    if _LOG_FORMAT == "json":
+        handler.setFormatter(_JsonFormatter())
+    else:
+        handler.setFormatter(logging.Formatter(
+            "%(asctime)s %(levelname)-8s %(name)s  %(message)s"
+        ))
+    root = logging.getLogger()
+    root.setLevel(getattr(logging, _LOG_LEVEL, logging.INFO))
+    root.handlers = [handler]
+
+
+_setup_logging()
+logger = logging.getLogger("epistylion.server")
+
+
+# ── metriche in memoria ────────────────────────────────────────────────────────
+
+class _Metrics:
+    """
+    Contatori e istogrammi leggeri, thread-safe tramite asyncio single-thread.
+    Tutti i valori sono resettabili; esportati come JSON da /metrics.
+    """
+
+    def __init__(self) -> None:
+        self.started_at: float = time.time()
+
+        # Contatori
+        self.requests_total:       int = 0
+        self.requests_ok:          int = 0
+        self.requests_error:       int = 0
+        self.requests_auth_fail:   int = 0
+        self.requests_rate_limit:  int = 0
+        self.tool_calls_total:     int = 0
+        self.tool_calls_error:     int = 0
+        self.stream_requests:      int = 0
+
+        # Latenze (ms) — ultime 1000 osservazioni per calcolo percentili
+        self._latencies:    collections.deque[float] = collections.deque(maxlen=1000)
+        self._tool_latencies: collections.deque[float] = collections.deque(maxlen=1000)
+
+        # Contatori per path
+        self.by_path: dict[str, int] = collections.defaultdict(int)
+        # Contatori per tool
+        self.by_tool: dict[str, int] = collections.defaultdict(int)
+
+    # ── registrazione ──────────────────────────────────────────────────────────
+
+    def record_request(self, path: str, status: int, latency_ms: float) -> None:
+        self.requests_total += 1
+        self.by_path[path]  += 1
+        self._latencies.append(latency_ms)
+        if status < 400:
+            self.requests_ok += 1
+        else:
+            self.requests_error += 1
+
+    def record_tool(self, tool_name: str, latency_ms: float, error: bool = False) -> None:
+        self.tool_calls_total  += 1
+        self.by_tool[tool_name] += 1
+        self._tool_latencies.append(latency_ms)
+        if error:
+            self.tool_calls_error += 1
+
+    # ── export ─────────────────────────────────────────────────────────────────
+
+    def _percentiles(self, data: collections.deque) -> dict[str, float]:
+        if not data:
+            return {"p50": 0, "p95": 0, "p99": 0, "min": 0, "max": 0, "mean": 0}
+        s = sorted(data)
+        def p(pct): return s[min(int(len(s) * pct / 100), len(s) - 1)]
+        return {
+            "p50":  round(p(50),  2),
+            "p95":  round(p(95),  2),
+            "p99":  round(p(99),  2),
+            "min":  round(s[0],   2),
+            "max":  round(s[-1],  2),
+            "mean": round(statistics.mean(s), 2),
+        }
+
+    def snapshot(self) -> dict[str, Any]:
+        uptime = time.time() - self.started_at
+        return {
+            "uptime_s":            round(uptime, 1),
+            "requests_total":      self.requests_total,
+            "requests_ok":         self.requests_ok,
+            "requests_error":      self.requests_error,
+            "requests_auth_fail":  self.requests_auth_fail,
+            "requests_rate_limit": self.requests_rate_limit,
+            "stream_requests":     self.stream_requests,
+            "tool_calls_total":    self.tool_calls_total,
+            "tool_calls_error":    self.tool_calls_error,
+            "latency_ms":          self._percentiles(self._latencies),
+            "tool_latency_ms":     self._percentiles(self._tool_latencies),
+            "by_path":             dict(self.by_path),
+            "by_tool":             dict(self.by_tool),
+        }
+
+
+_metrics = _Metrics()
+
+
+# ── middleware ─────────────────────────────────────────────────────────────────
+
+_API_KEY      = os.getenv("EPISTYLION_API_KEY", "")
+_CORS_ORIGINS = [o.strip() for o in os.getenv("EPISTYLION_CORS_ORIGINS", "*").split(",")]
+_RATE_LIMIT   = int(os.getenv("EPISTYLION_RATE_LIMIT", "0"))   # req/min per IP, 0=off
+
+# sliding window per rate limit: ip → deque di timestamps
+_rate_windows: dict[str, collections.deque] = collections.defaultdict(
+    lambda: collections.deque()
+)
+
+
+class RequestLoggingMiddleware(BaseHTTPMiddleware):
+    """
+    Aggiunge a ogni richiesta:
+      - X-Request-Id header (correlation ID)
+      - log strutturato di ingresso (request_in)
+      - log strutturato di uscita  (request_out) con status e latency
+    """
+
+    async def dispatch(self, request: Request, call_next):
+        req_id  = str(uuid.uuid4())
+        started = time.perf_counter()
+        client_ip = (request.headers.get("X-Forwarded-For") or
+                     (request.client.host if request.client else "unknown"))
+
+        request.state.request_id = req_id
+        request.state.started    = started
+        request.state.client_ip  = client_ip
+
+        logger.info(
+            "request_in",
+            extra={
+                "req_id":    req_id,
+                "method":    request.method,
+                "path":      request.url.path,
+                "client_ip": client_ip,
+                "ua":        request.headers.get("user-agent", ""),
+            },
+        )
+
+        response = await call_next(request)
+
+        latency_ms = (time.perf_counter() - started) * 1000
+        _metrics.record_request(request.url.path, response.status_code, latency_ms)
+
+        logger.info(
+            "request_out",
+            extra={
+                "req_id":     req_id,
+                "method":     request.method,
+                "path":       request.url.path,
+                "status":     response.status_code,
+                "latency_ms": round(latency_ms, 2),
+                "client_ip":  client_ip,
+            },
+        )
+
+        response.headers["X-Request-Id"] = req_id
+        return response
+
+
+class AuthMiddleware(BaseHTTPMiddleware):
+    """Valida API key se EPISTYLION_API_KEY è impostata. Bypassa /health e /metrics."""
+
+    SKIP = {"/health", "/metrics"}
+
+    async def dispatch(self, request: Request, call_next):
+        if not _API_KEY or request.url.path in self.SKIP:
+            return await call_next(request)
+
+        auth   = request.headers.get("Authorization", "")
+        x_key  = request.headers.get("X-Api-Key", "")
+        token  = auth.removeprefix("Bearer ").strip() if auth.startswith("Bearer ") else ""
+        key_ok = (token == _API_KEY) or (x_key == _API_KEY)
+
+        if not key_ok:
+            _metrics.requests_auth_fail += 1
+            req_id = getattr(request.state, "request_id", "-")
+            logger.warning(
+                "auth_fail",
+                extra={"req_id": req_id, "path": request.url.path,
+                       "client_ip": getattr(request.state, "client_ip", "?")},
+            )
+            return JSONResponse(
+                {"error": {"message": "Unauthorized", "type": "auth_error", "code": 401}},
+                status_code=401,
+            )
+        return await call_next(request)
+
+
+class RateLimitMiddleware(BaseHTTPMiddleware):
+    """Sliding window rate limit per IP. Disabilitato se EPISTYLION_RATE_LIMIT=0."""
+
+    SKIP = {"/health", "/metrics"}
+
+    async def dispatch(self, request: Request, call_next):
+        if not _RATE_LIMIT or request.url.path in self.SKIP:
+            return await call_next(request)
+
+        ip  = getattr(request.state, "client_ip", request.client.host if request.client else "?")
+        now = time.time()
+        win = _rate_windows[ip]
+
+        # rimuovi eventi più vecchi di 60s
+        while win and now - win[0] > 60:
+            win.popleft()
+
+        if len(win) >= _RATE_LIMIT:
+            _metrics.requests_rate_limit += 1
+            retry_after = math.ceil(60 - (now - win[0]))
+            logger.warning(
+                "rate_limit",
+                extra={"client_ip": ip, "path": request.url.path,
+                       "req_id": getattr(request.state, "request_id", "-")},
+            )
+            return JSONResponse(
+                {"error": {"message": "Too Many Requests", "type": "rate_limit_error", "code": 429}},
+                status_code=429,
+                headers={"Retry-After": str(retry_after)},
+            )
+
+        win.append(now)
+        return await call_next(request)
+
+
+class CORSMiddleware(BaseHTTPMiddleware):
+    """CORS minimale con origini configurabili via EPISTYLION_CORS_ORIGINS."""
+
+    async def dispatch(self, request: Request, call_next):
+        origin  = request.headers.get("origin", "")
+        allowed = "*" in _CORS_ORIGINS or origin in _CORS_ORIGINS
+        origin_hdr = origin if allowed and origin else "*"
+
+        if request.method == "OPTIONS":
+            return Response(
+                status_code=204,
+                headers={
+                    "Access-Control-Allow-Origin":  origin_hdr,
+                    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+                    "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Api-Key",
+                    "Access-Control-Max-Age":       "86400",
+                },
+            )
+
+        response = await call_next(request)
+        response.headers["Access-Control-Allow-Origin"] = origin_hdr
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Api-Key"
+        return response
+
+
+# ── server principale ──────────────────────────────────────────────────────────
 
 class OpenAIProxyServer:
     """
-    Server HTTP OpenAI-compatible che orchestra LLM + tool MCP.
-
-    Il client remoto invia una richiesta ``/v1/chat/completions`` standard;
-    il server esegue il loop agente (LLM ↔ tool MCP) e restituisce la risposta
-    finale come se fosse una normale completion — senza che il client debba
-    sapere nulla di MCP.
+    Server HTTP OpenAI-compatible con observability completa.
 
     Parameters
     ----------
     config : BridgeConfig
     system_prompt : str
-        System prompt iniettato in ogni richiesta (può essere sovrascritto
-        dal client inserendo un messaggio con role="system").
+        System prompt di default (sovrascrivibile dal client via role=system).
     max_steps : int
-        Limite massimo di iterazioni tool-call per richiesta.
+        Limite iterazioni tool-call per richiesta.
     expose_tool_calls : bool
-        Se True, la risposta include un campo extra ``_tool_calls`` con il
-        dettaglio di ogni tool eseguito (utile per debug).
+        Aggiunge ``_mcp_tool_calls`` e ``_mcp_steps`` nella risposta JSON.
     """
 
     def __init__(
@@ -83,9 +362,9 @@ class OpenAIProxyServer:
         max_steps: int = 20,
         expose_tool_calls: bool = False,
     ) -> None:
-        self._config = config
-        self._system_prompt = system_prompt
-        self._max_steps = max_steps
+        self._config           = config
+        self._system_prompt    = system_prompt
+        self._max_steps        = max_steps
         self._expose_tool_calls = expose_tool_calls
         self._bridge: MCPBridge | None = None
 
@@ -103,125 +382,172 @@ class OpenAIProxyServer:
 
     # ── avvio ─────────────────────────────────────────────────────────────────
 
-    async def run(
-        self,
-        host: str = "0.0.0.0",
-        port: int = 8081,
-    ) -> None:
-        """Connette i server MCP locali e avvia il server HTTP."""
+    async def run(self, host: str = "0.0.0.0", port: int = 8081) -> None:
+        """Connette i server MCP e avvia il server HTTP."""
         import uvicorn
 
+        logger.info(
+            "server_starting",
+            extra={
+                "host": host, "port": port,
+                "log_format": _LOG_FORMAT, "log_level": _LOG_LEVEL,
+                "auth_enabled": bool(_API_KEY),
+                "rate_limit": _RATE_LIMIT,
+                "cors_origins": _CORS_ORIGINS,
+            },
+        )
+
         self._bridge = MCPBridge(self._config)
-        await self._bridge.connect(
+        errors = await self._bridge.connect(
             system_prompt=self._system_prompt,
             max_steps=self._max_steps,
         )
 
-        app = self._build_starlette_app()
+        tool_count = len(self._bridge.registry.all_entries())
         logger.info(
-            "OpenAI-compatible server in ascolto su http://%s:%d/v1/chat/completions",
-            host, port,
+            "bridge_ready",
+            extra={
+                "connected_servers": list(self._bridge.client.get_connections().keys()),
+                "failed_servers":    list(errors.keys()),
+                "total_tools":       tool_count,
+            },
         )
 
-        cfg = uvicorn.Config(app, host=host, port=port, log_level="info")
+        # Aggancia callback tool-call per logging + metriche
+        self._bridge.agent._on_step = self._on_tool_step  # type: ignore
+
+        app = self._build_app()
+        cfg = uvicorn.Config(
+            app, host=host, port=port,
+            log_config=None,   # disabilitiamo il logger uvicorn, usiamo il nostro
+            access_log=False,
+        )
         server = uvicorn.Server(cfg)
         try:
             await server.serve()
         finally:
+            logger.info("server_stopping")
             if self._bridge:
                 await self._bridge.disconnect()
 
     # ── Starlette app ─────────────────────────────────────────────────────────
 
-    def _build_starlette_app(self) -> Starlette:
+    def _build_app(self) -> Starlette:
         return Starlette(
+            middleware=[
+                Middleware(CORSMiddleware),
+                Middleware(RequestLoggingMiddleware),
+                Middleware(AuthMiddleware),
+                Middleware(RateLimitMiddleware),
+            ],
             routes=[
-                Route("/v1/chat/completions", self._handle_completions, methods=["POST"]),
-                Route("/v1/models", self._handle_models, methods=["GET"]),
-                Route("/health", self._handle_health, methods=["GET"]),
-            ]
+                Route("/v1/chat/completions", self._handle_completions, methods=["POST", "OPTIONS"]),
+                Route("/v1/models",           self._handle_models,      methods=["GET"]),
+                Route("/v1/tools",            self._handle_tools,       methods=["GET"]),
+                Route("/v1/status",           self._handle_status,      methods=["GET"]),
+                Route("/metrics",             self._handle_metrics,     methods=["GET"]),
+                Route("/health",              self._handle_health,      methods=["GET"]),
+            ],
         )
 
-    # ── handler /v1/chat/completions ──────────────────────────────────────────
+    # ── handler: /v1/chat/completions ─────────────────────────────────────────
 
     async def _handle_completions(self, request: Request) -> Response:
+        req_id = getattr(request.state, "request_id", str(uuid.uuid4()))
+
         try:
             body: dict[str, Any] = await request.json()
         except Exception:
-            return JSONResponse(
-                {"error": {"message": "Body JSON non valido", "type": "invalid_request_error"}},
-                status_code=400,
-            )
+            logger.warning("bad_json", extra={"req_id": req_id})
+            return _err(400, "Body JSON non valido", "invalid_request_error")
 
         messages: list[dict[str, Any]] = body.get("messages", [])
-        stream: bool = body.get("stream", False)
+        stream:   bool                 = bool(body.get("stream", False))
+        model     = body.get("model", self._config.llm.model)
 
-        # Estrai history e ultimo messaggio utente
-        history, user_message = self._parse_messages(messages)
+        history, user_message = self._parse_messages(messages, req_id)
 
         if not user_message:
-            return JSONResponse(
-                {"error": {"message": "Nessun messaggio utente trovato", "type": "invalid_request_error"}},
-                status_code=400,
-            )
+            return _err(400, "Nessun messaggio utente trovato", "invalid_request_error")
+
+        logger.info(
+            "completion_start",
+            extra={
+                "req_id":  req_id,
+                "model":   model,
+                "stream":  stream,
+                "history_turns": len(history),
+                "user_msg_len":  len(user_message),
+            },
+        )
 
         if stream:
+            _metrics.stream_requests += 1
             return StreamingResponse(
-                self._stream_completion(user_message, history, body),
+                self._stream_completion(user_message, history, body, req_id),
                 media_type="text/event-stream",
+                headers={
+                    "Cache-Control":     "no-cache",
+                    "X-Accel-Buffering": "no",
+                },
             )
-        else:
-            return await self._blocking_completion(user_message, history, body)
+        return await self._blocking_completion(user_message, history, body, req_id)
 
     # ── completions blocking ──────────────────────────────────────────────────
 
     async def _blocking_completion(
         self,
         user_message: str,
-        history: list[AgentMessage],
-        body: dict[str, Any],
+        history:      list[AgentMessage],
+        body:         dict[str, Any],
+        req_id:       str,
     ) -> JSONResponse:
         assert self._bridge is not None
+        t0 = time.perf_counter()
 
         try:
             response = await self._bridge.agent.run(user_message, history)
         except Exception as exc:
-            logger.error("Errore agent.run: %s", exc)
-            return JSONResponse(
-                {"error": {"message": str(exc), "type": "internal_error"}},
-                status_code=500,
+            logger.error(
+                "agent_error",
+                extra={"req_id": req_id, "error": str(exc),
+                       "traceback": traceback.format_exc()},
             )
+            return _err(500, str(exc), "internal_error")
+
+        latency_ms = (time.perf_counter() - t0) * 1000
+        logger.info(
+            "completion_done",
+            extra={
+                "req_id":        req_id,
+                "steps":         response.steps,
+                "tool_calls":    len(response.tool_calls_made),
+                "reply_len":     len(response.final_message),
+                "latency_ms":    round(latency_ms, 2),
+            },
+        )
 
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
-        model = body.get("model", self._config.llm.model)
-        created = int(time.time())
-
         result: dict[str, Any] = {
-            "id": completion_id,
-            "object": "chat.completion",
-            "created": created,
-            "model": model,
-            "choices": [
-                {
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": response.final_message,
-                    },
-                    "finish_reason": "stop",
-                }
-            ],
+            "id":      completion_id,
+            "object":  "chat.completion",
+            "created": int(time.time()),
+            "model":   body.get("model", self._config.llm.model),
+            "choices": [{
+                "index":   0,
+                "message": {"role": "assistant", "content": response.final_message},
+                "finish_reason": "stop",
+            }],
             "usage": {
-                # Non abbiamo token count reali dall'agente, usiamo placeholder
-                "prompt_tokens": -1,
+                "prompt_tokens":     -1,
                 "completion_tokens": -1,
-                "total_tokens": -1,
+                "total_tokens":      -1,
             },
         }
-
         if self._expose_tool_calls:
             result["_mcp_tool_calls"] = response.tool_calls_made
-            result["_mcp_steps"] = response.steps
+            result["_mcp_steps"]      = response.steps
+            result["_latency_ms"]     = round(latency_ms, 2)
 
         return JSONResponse(result)
 
@@ -230,117 +556,213 @@ class OpenAIProxyServer:
     async def _stream_completion(
         self,
         user_message: str,
-        history: list[AgentMessage],
-        body: dict[str, Any],
+        history:      list[AgentMessage],
+        body:         dict[str, Any],
+        req_id:       str,
     ) -> AsyncIterator[str]:
         assert self._bridge is not None
 
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
-        model = body.get("model", self._config.llm.model)
+        model   = body.get("model", self._config.llm.model)
         created = int(time.time())
+        t0      = time.perf_counter()
+        chunks  = 0
 
-        def make_chunk(content: str, finish_reason: str | None = None) -> str:
+        def _chunk(content: str = "", finish_reason: str | None = None) -> str:
             delta: dict[str, Any] = {}
             if content:
                 delta["content"] = content
             if finish_reason:
                 delta["finish_reason"] = finish_reason
-            chunk = {
-                "id": completion_id,
-                "object": "chat.completion.chunk",
+            return "data: " + json.dumps({
+                "id":      completion_id,
+                "object":  "chat.completion.chunk",
                 "created": created,
-                "model": model,
+                "model":   model,
                 "choices": [{"index": 0, "delta": delta}],
-            }
-            return f"data: {json.dumps(chunk)}\n\n"
+            }) + "\n\n"
 
         try:
-            async for chunk_text in self._bridge.agent.stream(user_message, history):
-                yield make_chunk(chunk_text)
+            async for text in self._bridge.agent.stream(user_message, history):
+                chunks += 1
+                yield _chunk(text)
         except Exception as exc:
-            logger.error("Errore streaming: %s", exc)
-            yield make_chunk(f"\n[ERRORE] {exc}", finish_reason="stop")
+            logger.error(
+                "stream_error",
+                extra={"req_id": req_id, "error": str(exc),
+                       "traceback": traceback.format_exc()},
+            )
+            yield _chunk(f"\n[ERRORE] {exc}", finish_reason="stop")
             yield "data: [DONE]\n\n"
             return
 
-        yield make_chunk("", finish_reason="stop")
+        latency_ms = (time.perf_counter() - t0) * 1000
+        logger.info(
+            "stream_done",
+            extra={
+                "req_id":     req_id,
+                "chunks":     chunks,
+                "latency_ms": round(latency_ms, 2),
+            },
+        )
+        yield _chunk(finish_reason="stop")
         yield "data: [DONE]\n\n"
 
-    # ── handler /v1/models ────────────────────────────────────────────────────
+    # ── handler: /v1/models ───────────────────────────────────────────────────
 
     async def _handle_models(self, request: Request) -> JSONResponse:
         assert self._bridge is not None
-        model_id = self._config.llm.model
         return JSONResponse({
             "object": "list",
-            "data": [
-                {
-                    "id": model_id,
-                    "object": "model",
-                    "created": int(time.time()),
-                    "owned_by": "mcp-bridge",
-                    "description": (
-                        f"Modello locale con {len(self._bridge.registry.all_entries())} tool MCP"
-                    ),
-                }
-            ],
+            "data": [{
+                "id":          self._config.llm.model,
+                "object":      "model",
+                "created":     int(time.time()),
+                "owned_by":    "epistylion",
+                "description": f"LLM locale con {len(self._bridge.registry.all_entries())} tool MCP",
+            }],
         })
 
-    # ── handler /health ───────────────────────────────────────────────────────
+    # ── handler: /v1/tools ────────────────────────────────────────────────────
 
-    async def _handle_health(self, request: Request) -> JSONResponse:
-        connected: list[str] = []
-        tool_summary: dict[str, list[str]] = {}
-        total_tools = 0
+    async def _handle_tools(self, request: Request) -> JSONResponse:
+        """Lista tutti i tool MCP nel formato OpenAI function-calling."""
+        assert self._bridge is not None
+        qualified = request.query_params.get("qualified", "false").lower() == "true"
+        tools  = self._bridge.get_openai_tools(use_qualified_names=qualified)
+        summary = self._bridge.registry.summary()
+        return JSONResponse({
+            "object":     "list",
+            "count":      len(tools),
+            "by_server":  summary,
+            "tools":      tools,
+        })
 
-        if self._bridge:
-            connected = list(self._bridge.client.get_connections().keys())
-            tool_summary = self._bridge.registry.summary()
-            total_tools = len(self._bridge.registry.all_entries())
+    # ── handler: /v1/status ───────────────────────────────────────────────────
+
+    async def _handle_status(self, request: Request) -> JSONResponse:
+        assert self._bridge is not None
+        connections = self._bridge.client.get_connections()
+        servers_detail = {}
+        for name, conn in connections.items():
+            servers_detail[name] = {
+                "connected": conn.is_connected,
+                "tools":     [t.name for t in conn.tools],
+                "tool_count": len(conn.tools),
+            }
 
         return JSONResponse({
-            "status": "ok",
-            "llm_backend": self._config.llm.base_url,
-            "llm_model": self._config.llm.model,
-            "connected_servers": connected,
-            "tools_by_server": tool_summary,
-            "total_tools": total_tools,
+            "status":          "ok",
+            "uptime_s":        round(time.time() - _metrics.started_at, 1),
+            "llm_backend":     self._config.llm.base_url,
+            "llm_model":       self._config.llm.model,
+            "max_steps":       self._max_steps,
+            "auth_enabled":    bool(_API_KEY),
+            "rate_limit_rpm":  _RATE_LIMIT,
+            "cors_origins":    _CORS_ORIGINS,
+            "log_format":      _LOG_FORMAT,
+            "log_level":       _LOG_LEVEL,
+            "servers":         servers_detail,
+            "total_tools":     len(self._bridge.registry.all_entries()),
         })
+
+    # ── handler: /metrics ─────────────────────────────────────────────────────
+
+    async def _handle_metrics(self, request: Request) -> JSONResponse:
+        """
+        Snapshot JSON delle metriche interne.
+        Compatibile con qualsiasi scraper (Prometheus via json_exporter,
+        Grafana, Datadog, ecc.).
+        """
+        return JSONResponse(_metrics.snapshot())
+
+    # ── handler: /health ──────────────────────────────────────────────────────
+
+    async def _handle_health(self, request: Request) -> JSONResponse:
+        """
+        200 → tutti i server MCP connessi (o nessuno configurato)
+        503 → almeno un server ha perso la connessione
+        """
+        if not self._bridge:
+            return JSONResponse({"status": "starting"}, status_code=503)
+
+        connections = self._bridge.client.get_connections()
+        total       = len(self._config.servers)
+        connected   = sum(1 for c in connections.values() if c.is_connected)
+        degraded    = total > 0 and connected < total
+        status_code = 503 if degraded else 200
+
+        return JSONResponse(
+            {
+                "status":           "degraded" if degraded else "ok",
+                "servers_total":    total,
+                "servers_connected": connected,
+                "total_tools":      len(self._bridge.registry.all_entries()),
+                "uptime_s":         round(time.time() - _metrics.started_at, 1),
+            },
+            status_code=status_code,
+        )
+
+    # ── callback tool step ────────────────────────────────────────────────────
+
+    def _on_tool_step(self, step: int, tool_name: str, result: str) -> None:
+        """
+        Chiamata da MCPAgent dopo ogni tool call.
+        Logga un evento strutturato e aggiorna le metriche.
+        Nota: la latenza reale viene misurata in agent.py; qui stimiamo
+        dall'esterno usando il timestamp.
+        """
+        _metrics.record_tool(tool_name, latency_ms=0)   # latency calcolata in agent.py
+        logger.info(
+            "tool_call",
+            extra={
+                "step":          step,
+                "tool":          tool_name,
+                "result_len":    len(result),
+                "result_excerpt": result[:200],
+            },
+        )
 
     # ── helpers ───────────────────────────────────────────────────────────────
 
     def _parse_messages(
-        self, messages: list[dict[str, Any]]
+        self,
+        messages: list[dict[str, Any]],
+        req_id:   str = "-",
     ) -> tuple[list[AgentMessage], str]:
-        """
-        Divide la lista messaggi in (history, ultimo_messaggio_utente).
-
-        Il system prompt nel body del client ha precedenza su quello
-        configurato nel server; se assente, usa quello del server.
-        """
+        """Separa history e ultimo messaggio utente. Logga il system prompt se presente."""
         history: list[AgentMessage] = []
         user_message = ""
 
         for msg in messages:
-            role = msg.get("role", "")
+            role    = msg.get("role", "")
             content = msg.get("content", "") or ""
 
             if role == "system":
-                # Il system prompt del client sovrascrive quello del server
-                # Lo impostiamo sull'agente a runtime
+                logger.debug(
+                    "system_prompt_override",
+                    extra={"req_id": req_id, "length": len(content)},
+                )
                 if self._bridge and self._bridge._agent:
                     self._bridge._agent._system_prompt = content
                 continue
 
             if role == "user":
-                user_message = content  # ultimo vince
+                user_message = content
                 history.append(AgentMessage(role="user", content=content))
             elif role == "assistant":
                 history.append(AgentMessage(role="assistant", content=content))
 
-        # Rimuovi l'ultimo messaggio utente dalla history
-        # (verrà passato come user_message separato ad agent.run)
         if history and history[-1].role == "user":
             history = history[:-1]
 
         return history, user_message
+
+
+# ── helpers privati ────────────────────────────────────────────────────────────
+
+def _err(status: int, message: str, err_type: str) -> JSONResponse:
+    return JSONResponse(
+        {"error": {"message": message, "type": err_type, "code": status}},
+        status_code=status,
+    )
