@@ -52,9 +52,9 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
-from .agent import AgentMessage
-from .bridge import MCPBridge
-from .config import BridgeConfig, load_config
+from agent import AgentMessage
+from epistylion import MCPBridge
+from config import BridgeConfig, load_config
 
 # ── logging strutturato ────────────────────────────────────────────────────────
 

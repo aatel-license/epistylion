@@ -28,7 +28,7 @@ from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.prompt import Prompt
 
-from .config import load_config
+from config import load_config
 from agent import AgentMessage          # import assoluto (non relativo)
 from epistylion import MCPBridge
 
@@ -141,7 +141,7 @@ async def cmd_chat(args: argparse.Namespace) -> None:
 
 async def cmd_serve_mcp(args: argparse.Namespace) -> None:
     """Avvia il server MCP HTTP/SSE proxy."""
-    from .server_mcp import MCPProxyServer
+    from server_mcp import MCPProxyServer
     server = MCPProxyServer.from_config(
         args.config, args.env,
         use_qualified_names=not args.no_qualified,
@@ -162,7 +162,7 @@ async def cmd_serve_mcp(args: argparse.Namespace) -> None:
 
 async def cmd_serve_openai(args: argparse.Namespace) -> None:
     """Avvia il server OpenAI-compatible con tool MCP integrati."""
-    from .server_openai import OpenAIProxyServer
+    from server_openai import OpenAIProxyServer
     server = OpenAIProxyServer.from_config(
         args.config, args.env,
         expose_tool_calls=args.expose_tool_calls,
