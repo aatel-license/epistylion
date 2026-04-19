@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Epistylion — Server Console</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:ital,wght@0,300;0,400;0,500;0,600;1,300&family=Barlow+Condensed:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+  <!-- ── SIDEBAR ─────────────────────────────────────────────────── -->
+  <aside id="sidebar">
+    <div id="brand">
+      <div id="brand-icon">
+        <svg viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <rect x="4" y="4" width="10" height="10" stroke="currentColor" stroke-width="1.5"/>
+          <rect x="18" y="4" width="10" height="10" stroke="currentColor" stroke-width="1.5"/>
+          <rect x="4" y="18" width="10" height="10" stroke="currentColor" stroke-width="1.5"/>
+          <rect x="18" y="18" width="10" height="10" stroke="currentColor" stroke-width="1.5"/>
+          <line x1="9" y1="14" x2="9" y2="18" stroke="currentColor" stroke-width="1.5"/>
+          <line x1="23" y1="14" x2="23" y2="18" stroke="currentColor" stroke-width="1.5"/>
+          <line x1="14" y1="9" x2="18" y2="9" stroke="currentColor" stroke-width="1.5"/>
+          <line x1="14" y1="23" x2="18" y2="23" stroke="currentColor" stroke-width="1.5"/>
+        </svg>
+      </div>
+      <div id="brand-text">
+        <span id="brand-name">Epistylion</span>
+        <span id="brand-sub">Server Console</span>
+      </div>
+    </div>
+
+    <nav id="nav">
+      <button class="nav-btn active" data-tab="dashboard">
+        <span class="nav-icon">⬡</span>
+        <span>Dashboard</span>
+      </button>
+      <button class="nav-btn" data-tab="chat">
+        <span class="nav-icon">⬡</span>
+        <span>Chat</span>
+      </button>
+      <button class="nav-btn" data-tab="tools">
+        <span class="nav-icon">⬡</span>
+        <span>Tools</span>
+      </button>
+      <button class="nav-btn" data-tab="metrics">
+        <span class="nav-icon">⬡</span>
+        <span>Metrics</span>
+      </button>
+      <button class="nav-btn" data-tab="settings">
+        <span class="nav-icon">⬡</span>
+        <span>Settings</span>
+      </button>
+    </nav>
+
+    <div id="sidebar-status">
+      <div id="status-dot" class="dot-unknown"></div>
+      <div id="status-text">
+        <span id="status-label">Unknown</span>
+        <span id="status-url">—</span>
+      </div>
+      <button id="refresh-btn" title="Refresh">↻</button>
+    </div>
+  </aside>
+
+  <!-- ── MAIN ────────────────────────────────────────────────────── -->
+  <main id="main">
+
+    <!-- ══ DASHBOARD ══════════════════════════════════════════════ -->
+    <section id="tab-dashboard" class="tab active">
+      <header class="tab-header">
+        <h1>Dashboard</h1>
+        <div class="header-actions">
+          <label class="toggle-label">
+            <input type="checkbox" id="auto-refresh-toggle" />
+            <span class="toggle-track"></span>
+            Auto‑refresh
+          </label>
+          <span id="last-refresh" class="muted">Never</span>
+        </div>
+      </header>
+
+      <div class="grid-4">
+        <div class="kpi-card" id="kpi-status">
+          <div class="kpi-label">Status</div>
+          <div class="kpi-value" id="kpi-status-val">—</div>
+        </div>
+        <div class="kpi-card" id="kpi-uptime">
+          <div class="kpi-label">Uptime</div>
+          <div class="kpi-value" id="kpi-uptime-val">—</div>
+        </div>
+        <div class="kpi-card" id="kpi-tools">
+          <div class="kpi-label">Total Tools</div>
+          <div class="kpi-value" id="kpi-tools-val">—</div>
+        </div>
+        <div class="kpi-card" id="kpi-servers">
+          <div class="kpi-label">MCP Servers</div>
+          <div class="kpi-value" id="kpi-servers-val">—</div>
+        </div>
+      </div>
+
+      <div class="two-col">
+        <!-- LLM backend info -->
+        <div class="panel" id="panel-llm">
+          <div class="panel-title">LLM Backend</div>
+          <table class="info-table" id="llm-table">
+            <tr><td class="info-key">Base URL</td><td class="info-val" id="llm-url">—</td></tr>
+            <tr><td class="info-key">Model</td><td class="info-val" id="llm-model">—</td></tr>
+            <tr><td class="info-key">Max Steps</td><td class="info-val" id="llm-steps">—</td></tr>
+            <tr><td class="info-key">Auth</td><td class="info-val" id="llm-auth">—</td></tr>
+            <tr><td class="info-key">Rate Limit</td><td class="info-val" id="llm-rl">—</td></tr>
+          </table>
+        </div>
+
+        <!-- Connected servers -->
+        <div class="panel" id="panel-servers">
+          <div class="panel-title">Connected Servers</div>
+          <div id="servers-list">
+            <div class="empty-state">Loading…</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ══ CHAT ═══════════════════════════════════════════════════ -->
+    <section id="tab-chat" class="tab">
+      <header class="tab-header">
+        <h1>Chat</h1>
+        <div class="header-actions">
+          <button class="btn-ghost" id="clear-chat-btn">Clear</button>
+          <label class="toggle-label">
+            <input type="checkbox" id="stream-toggle" checked />
+            <span class="toggle-track"></span>
+            Stream
+          </label>
+        </div>
+      </header>
+
+      <div id="chat-system-bar">
+        <span class="muted">System&nbsp;→</span>
+        <input id="system-prompt" type="text"
+               placeholder="Override system prompt (optional)" />
+      </div>
+
+      <div id="chat-messages"></div>
+
+      <div id="chat-input-area">
+        <textarea id="chat-input" rows="3"
+                  placeholder="Type a message… (Ctrl+Enter to send)"></textarea>
+        <button id="chat-send-btn">
+          <span id="send-icon">▶</span>
+          <span id="send-label">Send</span>
+        </button>
+      </div>
+    </section>
+
+    <!-- ══ TOOLS ══════════════════════════════════════════════════ -->
+    <section id="tab-tools" class="tab">
+      <header class="tab-header">
+        <h1>Tools</h1>
+        <div class="header-actions">
+          <input id="tools-search" type="text" placeholder="Filter tools…" class="search-input" />
+          <label class="toggle-label">
+            <input type="checkbox" id="qualified-toggle" />
+            <span class="toggle-track"></span>
+            Qualified names
+          </label>
+          <button class="btn-ghost" id="reload-tools-btn">Reload</button>
+        </div>
+      </header>
+
+      <div id="tools-server-tabs"></div>
+      <div id="tools-grid"></div>
+    </section>
+
+    <!-- ══ METRICS ════════════════════════════════════════════════ -->
+    <section id="tab-metrics" class="tab">
+      <header class="tab-header">
+        <h1>Metrics</h1>
+        <div class="header-actions">
+          <label class="toggle-label">
+            <input type="checkbox" id="metrics-auto-toggle" />
+            <span class="toggle-track"></span>
+            Live (5s)
+          </label>
+          <button class="btn-ghost" id="reload-metrics-btn">Reload</button>
+        </div>
+      </header>
+
+      <div class="grid-4">
+        <div class="kpi-card">
+          <div class="kpi-label">Requests</div>
+          <div class="kpi-value" id="m-req-total">—</div>
+        </div>
+        <div class="kpi-card kpi-ok">
+          <div class="kpi-label">OK</div>
+          <div class="kpi-value" id="m-req-ok">—</div>
+        </div>
+        <div class="kpi-card kpi-err">
+          <div class="kpi-label">Errors</div>
+          <div class="kpi-value" id="m-req-err">—</div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-label">Tool Calls</div>
+          <div class="kpi-value" id="m-tool-total">—</div>
+        </div>
+      </div>
+
+      <div class="two-col">
+        <div class="panel">
+          <div class="panel-title">Request Latency (ms)</div>
+          <canvas id="chart-latency" height="180"></canvas>
+          <div id="latency-legend" class="chart-legend"></div>
+        </div>
+        <div class="panel">
+          <div class="panel-title">Tool Call Latency (ms)</div>
+          <canvas id="chart-tool-latency" height="180"></canvas>
+          <div id="tool-latency-legend" class="chart-legend"></div>
+        </div>
+      </div>
+
+      <div class="two-col">
+        <div class="panel">
+          <div class="panel-title">Requests by Path</div>
+          <canvas id="chart-by-path" height="200"></canvas>
+        </div>
+        <div class="panel">
+          <div class="panel-title">Calls by Tool</div>
+          <canvas id="chart-by-tool" height="200"></canvas>
+        </div>
+      </div>
+
+      <div class="panel" id="panel-extra-metrics">
+        <div class="panel-title">Additional Counters</div>
+        <div id="extra-metrics-grid" class="metrics-pill-grid"></div>
+      </div>
+    </section>
+
+    <!-- ══ SETTINGS ═══════════════════════════════════════════════ -->
+    <section id="tab-settings" class="tab">
+      <header class="tab-header">
+        <h1>Settings</h1>
+      </header>
+
+      <div class="settings-form">
+        <div class="settings-section">
+          <div class="settings-section-title">Connection</div>
+
+          <div class="field">
+            <label for="cfg-url">Server Base URL</label>
+            <input id="cfg-url" type="text" placeholder="http://localhost:8081" />
+            <span class="field-hint">Root URL of the Epistylion server (no trailing slash)</span>
+          </div>
+
+          <div class="field">
+            <label for="cfg-key">API Key</label>
+            <div class="input-row">
+              <input id="cfg-key" type="password" placeholder="Leave empty if auth is disabled" />
+              <button class="btn-ghost" id="toggle-key-vis">Show</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="settings-section">
+          <div class="settings-section-title">Agent</div>
+
+          <div class="field">
+            <label for="cfg-model">Model</label>
+            <input id="cfg-model" type="text" placeholder="local-model" />
+            <span class="field-hint">Passed as <code>model</code> in every completion request</span>
+          </div>
+
+          <div class="field">
+            <label for="cfg-refresh">Dashboard Auto‑refresh (seconds)</label>
+            <input id="cfg-refresh" type="number" min="5" max="300" value="10" />
+          </div>
+        </div>
+
+        <div class="settings-actions">
+          <button id="save-settings-btn" class="btn-primary">Save &amp; Connect</button>
+          <button id="reset-settings-btn" class="btn-ghost">Reset to defaults</button>
+          <span id="settings-saved-msg" class="saved-msg hidden">✓ Saved</span>
+        </div>
+      </div>
+    </section>
+
+  </main>
+
+
+  <!-- ── TOAST ────────────────────────────────────────────────────── -->
+  <div id="toast-container"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>
