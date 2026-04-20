@@ -19,6 +19,7 @@ GET  /v1/tools              Tool MCP disponibili in formato OpenAI
 GET  /v1/status             Stato runtime (uptime, contatori, server connessi)
 GET  /metrics               Metriche JSON (Prometheus-friendly labels)
 GET  /health                Health check (200 = ok, 503 = degraded)
+GET  /v1/skills             Returns the list of available skills in the Epistylion system
 
 Variabili d'ambiente
 --------------------
@@ -32,7 +33,6 @@ EPISTYLION_RATE_LIMIT    Richieste/minuto per IP, 0=disabilitato (default: 0)
 
 from __future__ import annotations
 
-import asyncio
 import collections
 import json
 import logging
@@ -443,6 +443,7 @@ class OpenAIProxyServer:
             routes=[
                 Route("/v1/chat/completions", self._handle_completions, methods=["POST", "OPTIONS"]),
                 Route("/v1/models",           self._handle_models,      methods=["GET"]),
+                Route("/v1/skills",           self._handle_skills,      methods=["GET"]),
                 Route("/v1/tools",            self._handle_tools,       methods=["GET"]),
                 Route("/v1/status",           self._handle_status,      methods=["GET"]),
                 Route("/metrics",             self._handle_metrics,     methods=["GET"]),
@@ -464,6 +465,7 @@ class OpenAIProxyServer:
         messages: list[dict[str, Any]] = body.get("messages", [])
         stream:   bool                 = bool(body.get("stream", False))
         model     = body.get("model", self._config.llm.model)
+        skill     = body.get("skill")  # skill da iniettare nel system prompt
 
         history, user_message = self._parse_messages(messages, req_id)
 
@@ -478,20 +480,21 @@ class OpenAIProxyServer:
                 "stream":  stream,
                 "history_turns": len(history),
                 "user_msg_len":  len(user_message),
+                "skill":    skill,
             },
         )
 
         if stream:
             _metrics.stream_requests += 1
             return StreamingResponse(
-                self._stream_completion(user_message, history, body, req_id),
+                self._stream_completion(user_message, history, body, req_id, skill),
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control":     "no-cache",
                     "X-Accel-Buffering": "no",
                 },
             )
-        return await self._blocking_completion(user_message, history, body, req_id)
+        return await self._blocking_completion(user_message, history, body, req_id, skill)
 
     # ── completions blocking ──────────────────────────────────────────────────
 
@@ -501,12 +504,13 @@ class OpenAIProxyServer:
         history:      list[AgentMessage],
         body:         dict[str, Any],
         req_id:       str,
+        skill:        str | None = None,
     ) -> JSONResponse:
         assert self._bridge is not None
         t0 = time.perf_counter()
 
         try:
-            response = await self._bridge.agent.run(user_message, history)
+            response = await self._bridge.agent.run(user_message, history, skill=skill)
         except Exception as exc:
             logger.error(
                 "agent_error",
@@ -559,6 +563,7 @@ class OpenAIProxyServer:
         history:      list[AgentMessage],
         body:         dict[str, Any],
         req_id:       str,
+        skill:        str | None = None,
     ) -> AsyncIterator[str]:
         assert self._bridge is not None
 
@@ -583,7 +588,7 @@ class OpenAIProxyServer:
             }) + "\n\n"
 
         try:
-            async for text in self._bridge.agent.stream(user_message, history):
+            async for text in self._bridge.agent.stream(user_message, history, skill=skill):
                 chunks += 1
                 yield _chunk(text)
         except Exception as exc:
@@ -638,7 +643,17 @@ class OpenAIProxyServer:
             "tools":      tools,
         })
 
-    # ── handler: /v1/status ───────────────────────────────────────────────────
+    # ── handler: /v1/skills ─────────────────────────────────────────────────
+
+    async def _handle_skills(self, request: Request) -> JSONResponse:
+        """Restituisce la lista delle skills disponibili."""
+        assert self._bridge is not None
+        skills = self._bridge._skill_registry.list()
+        return JSONResponse({
+            "skills": skills,
+        })
+
+    # ── handler: /v1/status ─────────────────────────────────────────────────
 
     async def _handle_status(self, request: Request) -> JSONResponse:
         assert self._bridge is not None
