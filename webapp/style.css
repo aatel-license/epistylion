@@ -510,6 +510,64 @@ input, textarea, button, select {
   font-size: 12px;
 }
 
+/* separator between system prompt and skill selector */
+.sys-bar-sep {
+  width: 1px;
+  height: 16px;
+  background: var(--border-2);
+  flex-shrink: 0;
+}
+
+/* skill dropdown */
+#skill-select {
+  background: none;
+  border: 1px solid var(--border-2);
+  border-radius: var(--radius);
+  color: var(--muted-2);
+  padding: 3px 8px;
+  outline: none;
+  cursor: pointer;
+  font-size: 11px;
+  letter-spacing: .04em;
+  transition: var(--transition);
+  max-width: 130px;
+}
+
+#skill-select:hover,
+#skill-select:focus {
+  border-color: var(--amber-dim);
+  color: var(--amber);
+}
+
+#skill-select option {
+  background: var(--bg-3);
+  color: var(--text);
+}
+
+/* active skill indicator on the selector itself */
+#skill-select.has-skill {
+  color: var(--amber);
+  border-color: var(--amber-dim);
+  background: var(--amber-glow);
+}
+
+/* skill badge shown next to "Assistant" in msg-role */
+.skill-badge {
+  display: inline-flex;
+  align-items: center;
+  margin-left: 7px;
+  padding: 1px 7px;
+  background: var(--amber-glow);
+  border: 1px solid var(--amber-dim);
+  border-radius: 10px;
+  font-size: 9px;
+  font-weight: 500;
+  letter-spacing: .06em;
+  color: var(--amber);
+  text-transform: none;
+  vertical-align: middle;
+}
+
 #chat-messages {
   flex: 1;
   overflow-y: auto;

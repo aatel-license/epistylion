@@ -107,6 +107,28 @@ async function loadDashboard() {
     el('llm-auth').textContent  = status.auth_enabled  ? '✓ enabled' : '✗ disabled';
     el('llm-rl').textContent    = status.rate_limit_rpm ? `${status.rate_limit_rpm} req/min` : 'disabled';
 
+    // skills
+    const skillsEl = el('llm-skills');
+    if (status.skills && status.skills.length) {
+      skillsEl.innerHTML = status.skills
+        .map(s => `<span class="tool-tag" style="color:var(--amber)">${s}</span>`)
+        .join(' ');
+    } else {
+      skillsEl.textContent = '—';
+    }
+    // refresh skill selector with latest list
+    if (status.skills) {
+      const sel = el('skill-select');
+      const current = sel.value;
+      sel.innerHTML = '<option value="">none</option>';
+      for (const name of status.skills) {
+        const opt = document.createElement('option');
+        opt.value = name; opt.textContent = name;
+        sel.appendChild(opt);
+      }
+      if (current && status.skills.includes(current)) sel.value = current;
+    }
+
     const servers = status.servers || {};
     const listEl  = el('servers-list');
     listEl.innerHTML = '';
@@ -159,13 +181,16 @@ function initDashboard() {
 
 let chatHistory = [];
 
-function appendMsg(role, content, streaming = false) {
+function appendMsg(role, content, streaming = false, skillUsed = '') {
   const wrap = el('chat-messages');
   const div  = document.createElement('div');
   div.className = `msg ${role}`;
   const labels = { user: 'You', assistant: 'Assistant', tool: 'Tool', error: 'Error' };
+  const skillBadge = (role === 'assistant' && skillUsed)
+    ? `<span class="skill-badge">⬡ ${skillUsed}</span>`
+    : '';
   div.innerHTML = `
-    <div class="msg-role">${labels[role] ?? role}</div>
+    <div class="msg-role">${labels[role] ?? role}${skillBadge}</div>
     <div class="msg-body${streaming ? ' typing-cursor' : ''}">${escHtml(content)}</div>
   `;
   wrap.appendChild(div);
@@ -187,6 +212,7 @@ async function sendChat() {
 
   const useStream = el('stream-toggle').checked;
   const sysPrompt = el('system-prompt').value.trim();
+  const activeSkill = el('skill-select').value;
 
   input.value = '';
   sendBtn.disabled = true;
@@ -199,7 +225,10 @@ async function sendChat() {
   if (sysPrompt) messages.push({ role: 'system', content: sysPrompt });
   messages.push(...chatHistory);
 
-  const body    = JSON.stringify({ model: cfg.model, messages, stream: useStream });
+  const payload = { model: cfg.model, messages, stream: useStream };
+  if (activeSkill) payload.skill = activeSkill;
+
+  const body    = JSON.stringify(payload);
   const headers = { 'Content-Type': 'application/json' };
   if (cfg.key) headers['X-Api-Key'] = cfg.key;
 
@@ -208,7 +237,7 @@ async function sendChat() {
       const resp = await fetch(cfg.url + '/v1/chat/completions', { method: 'POST', headers, body });
       if (!resp.ok) throw new Error(`${resp.status} ${resp.statusText}`);
 
-      const bodyEl  = appendMsg('assistant', '', true);
+      const bodyEl  = appendMsg('assistant', '', true, activeSkill);
       const reader  = resp.body.getReader();
       const decoder = new TextDecoder();
       let fullText = '', buf = '';
@@ -240,7 +269,7 @@ async function sendChat() {
       const data = await resp.json();
       if (data.error) throw new Error(data.error.message);
       const reply = data.choices?.[0]?.message?.content || '';
-      appendMsg('assistant', reply);
+      appendMsg('assistant', reply, false, activeSkill);
       chatHistory.push({ role: 'assistant', content: reply });
       if (data._mcp_tool_calls?.length) {
         for (const tc of data._mcp_tool_calls) {
@@ -257,6 +286,27 @@ async function sendChat() {
   }
 }
 
+async function loadSkills() {
+  try {
+    const data = await apiFetch('/v1/skills');
+    const skills = data.skills || [];
+    const sel = el('skill-select');
+    // preserve current selection
+    const current = sel.value;
+    // rebuild options
+    sel.innerHTML = '<option value="">none</option>';
+    for (const name of skills) {
+      const opt = document.createElement('option');
+      opt.value = name;
+      opt.textContent = name;
+      sel.appendChild(opt);
+    }
+    if (current && skills.includes(current)) sel.value = current;
+  } catch {
+    // /v1/skills not available yet — leave selector with only "none"
+  }
+}
+
 function initChat() {
   el('chat-send-btn').addEventListener('click', sendChat);
   el('chat-input').addEventListener('keydown', e => {
@@ -266,6 +316,11 @@ function initChat() {
     chatHistory = [];
     el('chat-messages').innerHTML = '';
     toast('Conversation cleared', 'info', 1500);
+  });
+  loadSkills();
+
+  el('skill-select').addEventListener('change', () => {
+    el('skill-select').classList.toggle('has-skill', !!el('skill-select').value);
   });
 }
 

@@ -111,6 +111,7 @@
             <tr><td class="info-key">Max Steps</td><td class="info-val" id="llm-steps">—</td></tr>
             <tr><td class="info-key">Auth</td><td class="info-val" id="llm-auth">—</td></tr>
             <tr><td class="info-key">Rate Limit</td><td class="info-val" id="llm-rl">—</td></tr>
+            <tr><td class="info-key">Skills</td><td class="info-val" id="llm-skills">—</td></tr>
           </table>
         </div>
 
@@ -142,6 +143,11 @@
         <span class="muted">System&nbsp;→</span>
         <input id="system-prompt" type="text"
                placeholder="Override system prompt (optional)" />
+        <div class="sys-bar-sep"></div>
+        <span class="muted">Skill&nbsp;→</span>
+        <select id="skill-select" title="Active skill">
+          <option value="">none</option>
+        </select>
       </div>
 
       <div id="chat-messages"></div>
