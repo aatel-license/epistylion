@@ -30,8 +30,11 @@ EPISTYLION_RATE_LIMIT    Richieste/minuto per IP, 0=disabilitato (default: 0)
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import math
+import os
 import statistics
 import time
 import uuid
@@ -96,7 +99,7 @@ def _setup_logging() -> None:
     root.handlers = [handler]
 
 
-_setupLogging()
+_setup_logging()
 logger = logging.getLogger("epistylion.server_mcp")
 
 # ── metriche in memoria ───────────────────────────────────────────────────────
@@ -278,7 +281,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
 
         ip  = getattr(request.state, "client_ip", request.client.host if request.client else "?")
-        now = time.perf_counter()
+        now = time.time()
         win = _metrics._rate_windows.get(ip, [])
         _metrics._rate_windows[ip] = win
 
@@ -356,6 +359,8 @@ class MCPProxyServer:
         self._bridge: MCPBridge | None = None
         self._mcp_server = Server("mcp-bridge-proxy")
         self._ready = asyncio.Event()
+        # Server-side disabled tool names (synced via PATCH /v1/tools/state)
+        self._disabled_tools: set[str] = set()
 
     # ── factory ───────────────────────────────────────────────────────────────
 
@@ -444,6 +449,8 @@ class MCPProxyServer:
     def _build_starlette_app(self) -> Starlette:
         sse_transport = SseServerTransport("/messages/")
 
+        # ── SSE (MCP protocol) ────────────────────────────────────────────────
+
         async def handle_sse(request: Request) -> Response:
             async with sse_transport.connect_sse(
                 request.scope, request.receive, request._send
@@ -455,101 +462,155 @@ class MCPProxyServer:
                 )
             return Response()
 
-        async def handle_health(request: Request) -> Response:
-            connected = list(self._bridge.client.get_connections().keys()) if self._bridge else []
-            tool_count = len(self._bridge.registry.all_entries()) if self._bridge else 0
-            body = json.dumps({
-                "status": "ok",
-                "connected_servers": connected,
-                "total_tools": tool_count,
+        # ── /health ───────────────────────────────────────────────────────────
+
+        async def handle_health(request: Request) -> JSONResponse:
+            if not self._bridge:
+                return JSONResponse({"status": "starting"}, status_code=503)
+            connections  = self._bridge.client.get_connections()
+            total        = len(self._config.servers)
+            connected    = sum(1 for c in connections.values() if c.is_connected)
+            degraded     = total > 0 and connected < total
+            tool_count   = len(self._bridge.registry.all_entries())
+            return JSONResponse(
+                {
+                    "status":            "degraded" if degraded else "ok",
+                    "servers_total":     total,
+                    "servers_connected": connected,
+                    "total_tools":       tool_count,
+                    "uptime_s":          round(time.time() - _metrics.started_at, 1),
+                },
+                status_code=503 if degraded else 200,
+            )
+
+        # ── /metrics ──────────────────────────────────────────────────────────
+
+        async def handle_metrics(request: Request) -> JSONResponse:
+            return JSONResponse(_metrics.snapshot())
+
+        # ── /v1/status ────────────────────────────────────────────────────────
+
+        async def handle_status(request: Request) -> JSONResponse:
+            if not self._bridge:
+                return JSONResponse({"status": "starting"}, status_code=503)
+            connections    = self._bridge.client.get_connections()
+            servers_detail = {}
+            for name, conn in connections.items():
+                servers_detail[name] = {
+                    "connected":  conn.is_connected,
+                    "tools":      [t.name for t in conn.tools],
+                    "tool_count": len(conn.tools),
+                }
+            return JSONResponse({
+                "status":         "ok",
+                "uptime_s":       round(time.time() - _metrics.started_at, 1),
+                "llm_backend":    "—",        # MCP proxy has no LLM backend
+                "llm_model":      "—",
+                "max_steps":      0,
+                "auth_enabled":   bool(_API_KEY),
+                "rate_limit_rpm": _RATE_LIMIT,
+                "servers":        servers_detail,
+                "total_tools":    len(self._bridge.registry.all_entries()),
+                "skills":         [],          # MCP proxy does not load skill files
             })
-            return Response(content=body, media_type="application/json")
+
+        # ── /v1/models ────────────────────────────────────────────────────────
+
+        async def handle_models(request: Request) -> JSONResponse:
+            tool_count = len(self._bridge.registry.all_entries()) if self._bridge else 0
+            return JSONResponse({
+                "object": "list",
+                "data": [{
+                    "id":          "epistylion-mcp-proxy",
+                    "object":      "model",
+                    "created":     int(time.time()),
+                    "owned_by":    "epistylion",
+                    "description": f"MCP aggregation proxy — {tool_count} tool MCP",
+                }],
+            })
+
+        # ── /v1/tools ─────────────────────────────────────────────────────────
+
+        async def handle_tools(request: Request) -> JSONResponse:
+            if not self._bridge:
+                return JSONResponse({"object": "list", "count": 0, "by_server": {}, "tools": []})
+            qualified = request.query_params.get("qualified", "false").lower() == "true"
+            tools     = self._bridge.get_openai_tools(use_qualified_names=qualified)
+            summary   = self._bridge.registry.summary()
+            return JSONResponse({
+                "object":    "list",
+                "count":     len(tools),
+                "by_server": summary,
+                "tools":     tools,
+            })
+
+        # ── /v1/skills ────────────────────────────────────────────────────────
+
+        async def handle_skills(request: Request) -> JSONResponse:
+            # MCP proxy does not manage skills — return empty list for compatibility
+            return JSONResponse({"skills": []})
+
+        # ── /v1/config (PATCH) ────────────────────────────────────────────────
+
+        async def handle_config(request: Request) -> JSONResponse:
+            """PATCH /v1/config — no-op on the MCP proxy (no LLM to reconfigure).
+            Returns 200 for client compatibility."""
+            if request.method == "OPTIONS":
+                return Response(status_code=204)
+            return JSONResponse({
+                "updated": {},
+                "note": "MCP proxy server has no LLM backend; model setting is ignored here.",
+            })
+
+        # ── /v1/tools/state (GET + PATCH) ─────────────────────────────────────
+
+        async def handle_tools_state(request: Request) -> JSONResponse:
+            """
+            GET  → returns currently disabled tool names.
+            PATCH → accepts { "disabled": ["tool_a", ...] } — stored in-process only.
+            """
+            if request.method == "OPTIONS":
+                return Response(status_code=204)
+            if request.method == "PATCH":
+                try:
+                    body: dict[str, Any] = await request.json()
+                except Exception:
+                    return JSONResponse(
+                        {"error": {"message": "Body JSON non valido", "type": "invalid_request_error", "code": 400}},
+                        status_code=400,
+                    )
+                disabled = body.get("disabled", [])
+                if not isinstance(disabled, list):
+                    return JSONResponse(
+                        {"error": {"message": "'disabled' deve essere una lista", "type": "invalid_request_error", "code": 400}},
+                        status_code=400,
+                    )
+                self._disabled_tools = set(str(t) for t in disabled)
+                logger.info("mcp_tools_state_updated", extra={"disabled_count": len(self._disabled_tools)})
+            return JSONResponse({
+                "disabled":       sorted(self._disabled_tools),
+                "disabled_count": len(self._disabled_tools),
+            })
 
         return Starlette(
+            middleware=[
+                Middleware(CORSMiddleware),
+                Middleware(RequestLoggingMiddleware),
+                Middleware(AuthMiddleware),
+                Middleware(RateLimitMiddleware),
+            ],
             routes=[
-                Route("/health", handle_health),
-                Mount("/", app=sse_transport.handle_post_message),
-                Route("/sse", handle_sse),
-            ]
+                # MCP protocol (SSE)
+                Route("/sse",            handle_sse),
+                Mount("/messages/",      app=sse_transport.handle_post_message),
+                # REST API — same surface as OpenAIProxyServer for console compatibility
+                Route("/health",         handle_health,      methods=["GET"]),
+                Route("/metrics",        handle_metrics,     methods=["GET"]),
+                Route("/v1/status",      handle_status,      methods=["GET"]),
+                Route("/v1/models",      handle_models,      methods=["GET"]),
+                Route("/v1/tools",       handle_tools,       methods=["GET"]),
+                Route("/v1/tools/state", handle_tools_state, methods=["GET", "PATCH", "OPTIONS"]),
+                Route("/v1/skills",      handle_skills,      methods=["GET"]),
+                Route("/v1/config",      handle_config,      methods=["PATCH", "OPTIONS"]),
+            ],
         )
-
-# ── import mancanti ───────────────────────────────────────────────────────────
-
-from agent import AgentMessage
-from epistylion import MCPBridge
-from config import BridgeConfig, load_config
-from registry import mcp_result_to_string
-
-# ── route handler per /v1/chat/completions ─────────────────────────────────────
-
-@router.post("/v1/chat/completions")
-async def handle_chat_completions(request: Request) -> Response:
-    """Gestisce le richieste di completamento con tool MCP."""
-    # TODO: Implementare logica completamenti
-    return JSONResponse({"error": "Not implemented"}, status_code=501)
-
-# ── route handler per /v1/models ─────────────────────────────────────────────
-
-@router.get("/v1/models")
-async def handle_models(request: Request) -> Response:
-    """Restituisce la lista dei modelli disponibili."""
-    return JSONResponse({
-        "object": "list",
-        "data": [{
-            "id": "epistylion-mcp",
-            "object": "model",
-            "created": int(time.time()),
-            "owned_by": "epistylion",
-        }],
-    })
-
-# ── route handler per /v1/tools ───────────────────────────────────────────────
-
-@router.get("/v1/tools")
-async def handle_tools(request: Request) -> Response:
-    """Restituisce i tool MCP disponibili."""
-    return JSONResponse({
-        "object": "list",
-        "count": 0,
-        "tools": [],
-    })
-
-# ── route handler per /v1/skills ─────────────────────────────────────────────
-
-@router.get("/v1/skills")
-async def handle_skills(request: Request) -> Response:
-    """Restituisce la lista delle skills disponibili."""
-    return JSONResponse({"skills": []})
-
-# ── route handler per /v1/status ─────────────────────────────────────────────
-
-@router.get("/v1/status")
-async def handle_status(request: Request) -> Response:
-    """Restituisce lo stato del server."""
-    return JSONResponse({
-        "status": "ok",
-        "uptime_s": 0,
-        "servers": [],
-        "total_tools": 0,
-    })
-
-# ── route handler per /metrics ───────────────────────────────────────────────
-
-@router.get("/metrics")
-async def handle_metrics(request: Request) -> Response:
-    """Restituisce le metriche in JSON."""
-    return JSONResponse(_metrics.snapshot())
-
-# ── route handler per /health ───────────────────────────────────────────────
-
-@router.get("/health")
-async def handle_health(request: Request) -> Response:
-    """Health check."""
-    return JSONResponse({"status": "ok"})
-
-# ── import mancanti per le route ─────────────────────────────────────────────
-
-from agent import AgentMessage
-from epistylion import MCPBridge
-from config import BridgeConfig, load_config
-from registry import mcp_result_to_string

@@ -682,7 +682,14 @@ class OpenAIProxyServer:
 
         Body JSON accettato::
 
-            { "model": "new-model-id" }
+            {
+              "model":        "new-model-id",
+              "agent_model":  "override sent per-request",
+              "base_url":     "https://openrouter.ai/api/v1",
+              "llm_api_key":  "sk-or-…",
+              "max_steps":    20,
+              "rate_limit":   60
+            }
 
         Restituisce la configurazione aggiornata.
         """
@@ -703,9 +710,60 @@ class OpenAIProxyServer:
                 if self._bridge:
                     self._bridge._config.llm.model = new_model
                 updated["model"] = new_model
-                logger.info("config_model_updated", extra={"model": new_model})
 
-        return JSONResponse({"updated": updated, "current_model": self._current_model})
+        if "agent_model" in body:
+            agent_model = str(body["agent_model"]).strip()
+            if agent_model:
+                # agent_model is the per-request override — keep it as the resolved model
+                self._current_model = agent_model
+                self._config.llm.model = agent_model
+                if self._bridge:
+                    self._bridge._config.llm.model = agent_model
+                updated["agent_model"] = agent_model
+
+        if "base_url" in body:
+            new_url = str(body["base_url"]).strip().rstrip("/")
+            if new_url:
+                self._config.llm.base_url = new_url
+                if self._bridge:
+                    self._bridge._config.llm.base_url = new_url
+                updated["base_url"] = new_url
+
+        if "llm_api_key" in body:
+            new_key = str(body["llm_api_key"]).strip()
+            if new_key and hasattr(self._config.llm, "api_key"):
+                self._config.llm.api_key = new_key
+                if self._bridge and hasattr(self._bridge._config.llm, "api_key"):
+                    self._bridge._config.llm.api_key = new_key
+                updated["llm_api_key"] = "***"
+
+        if "max_steps" in body:
+            try:
+                new_steps = int(body["max_steps"])
+                if new_steps > 0:
+                    self._max_steps = new_steps
+                    updated["max_steps"] = new_steps
+            except (TypeError, ValueError):
+                pass
+
+        if "rate_limit" in body:
+            try:
+                global _RATE_LIMIT
+                _RATE_LIMIT = max(0, int(body["rate_limit"]))
+                updated["rate_limit"] = _RATE_LIMIT
+            except (TypeError, ValueError):
+                pass
+
+        if updated:
+            logger.info("config_updated", extra={"fields": list(updated.keys())})
+
+        return JSONResponse({
+            "updated":       updated,
+            "current_model": self._current_model,
+            "base_url":      self._config.llm.base_url,
+            "max_steps":     self._max_steps,
+            "rate_limit":    _RATE_LIMIT,
+        })
 
     # ── handler: GET + PATCH /v1/tools/state ────────────────────────────────
 
