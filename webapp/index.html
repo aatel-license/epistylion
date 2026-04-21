@@ -248,47 +248,101 @@
     <section id="tab-settings" class="tab">
       <header class="tab-header">
         <h1>Settings</h1>
+        <div class="header-actions">
+          <button class="btn-ghost" id="fetch-backend-btn" title="Pull current values from the server">↻ Fetch from server</button>
+        </div>
       </header>
 
       <div class="settings-form">
+
+        <!-- ── 1. Connection ──────────────────────────────────── -->
         <div class="settings-section">
           <div class="settings-section-title">Connection</div>
 
           <div class="field">
-            <label for="cfg-url">Server Base URL</label>
+            <label for="cfg-url">Epistylion Server URL</label>
             <input id="cfg-url" type="text" placeholder="http://localhost:8081" />
             <span class="field-hint">Root URL of the Epistylion server (no trailing slash)</span>
           </div>
 
           <div class="field">
-            <label for="cfg-key">API Key</label>
+            <label for="cfg-key">Console API Key <span class="field-optional">(optional)</span></label>
             <div class="input-row">
               <input id="cfg-key" type="password" placeholder="Leave empty if auth is disabled" />
               <button class="btn-ghost" id="toggle-key-vis">Show</button>
             </div>
+            <span class="field-hint">Sent as <code>X-Api-Key</code> header to every request</span>
           </div>
         </div>
 
+        <!-- ── 2. LLM Backend ─────────────────────────────────── -->
+        <div class="settings-section">
+          <div class="settings-section-title">LLM Backend</div>
+
+          <div class="field">
+            <label for="cfg-llm-url">Base URL</label>
+            <input id="cfg-llm-url" type="text" placeholder="https://openrouter.ai/api/v1" />
+            <span class="field-hint">OpenAI-compatible endpoint used by the Epistylion agent</span>
+          </div>
+
+          <div class="field">
+            <label for="cfg-llm-model">Model</label>
+            <input id="cfg-llm-model" type="text" placeholder="google/gemma-3-27b-it:free" />
+            <span class="field-hint">Model ID forwarded to the LLM backend</span>
+          </div>
+
+          <div class="field-row">
+            <div class="field">
+              <label for="cfg-max-steps">Max Steps</label>
+              <input id="cfg-max-steps" type="number" min="1" max="200" placeholder="20" />
+              <span class="field-hint">Tool-call iterations per request</span>
+            </div>
+            <div class="field">
+              <label for="cfg-rate-limit">Rate Limit <span class="field-optional">(req/min, 0 = off)</span></label>
+              <input id="cfg-rate-limit" type="number" min="0" max="9999" placeholder="0" />
+              <span class="field-hint">Requests / minute per IP</span>
+            </div>
+          </div>
+
+          <div class="field">
+            <label for="cfg-llm-key">LLM API Key <span class="field-optional">(optional)</span></label>
+            <div class="input-row">
+              <input id="cfg-llm-key" type="password" placeholder="sk-or-… / leave empty for local" />
+              <button class="btn-ghost" id="toggle-llm-key-vis">Show</button>
+            </div>
+            <span class="field-hint">Sent to the LLM backend as <code>Authorization: Bearer …</code></span>
+          </div>
+
+          <div class="field">
+            <label>Skills</label>
+            <div id="cfg-skills-display" class="skills-readonly-list">
+              <span class="field-hint muted">— fetched from server —</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- ── 3. Agent ───────────────────────────────────────── -->
         <div class="settings-section">
           <div class="settings-section-title">Agent</div>
 
           <div class="field">
-            <label for="cfg-model">Model</label>
-            <input id="cfg-model" type="text" placeholder="local-model" />
-            <span class="field-hint">Passed as <code>model</code> in every completion request</span>
+            <label for="cfg-model">Model override</label>
+            <input id="cfg-model" type="text" placeholder="same as LLM Backend model" />
+            <span class="field-hint">Passed as <code>model</code> in every completion request. Leave empty to use the backend model.</span>
           </div>
 
           <div class="field">
-            <label for="cfg-refresh">Dashboard Auto‑refresh (seconds)</label>
+            <label for="cfg-refresh">Dashboard Auto‑refresh <span class="field-optional">(seconds)</span></label>
             <input id="cfg-refresh" type="number" min="5" max="300" value="10" />
           </div>
         </div>
 
         <div class="settings-actions">
-          <button id="save-settings-btn" class="btn-primary">Save &amp; Connect</button>
+          <button id="save-settings-btn" class="btn-primary">Save &amp; Apply</button>
           <button id="reset-settings-btn" class="btn-ghost">Reset to defaults</button>
           <span id="settings-saved-msg" class="saved-msg hidden">✓ Saved</span>
         </div>
+
       </div>
     </section>
 

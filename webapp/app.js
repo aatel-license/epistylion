@@ -7,10 +7,18 @@
 
 // ── Config ────────────────────────────────────────────────────────
 const DEFAULT_CFG = {
-  url:     '',
-  key:     '',
-  model:   'local-model',
-  refresh: 10,
+  // Connection — Epistylion server
+  url:          '',
+  key:          '',
+  // LLM Backend — sent to PATCH /v1/config on save
+  llm_url:      '',
+  llm_model:    '',
+  llm_key:      '',
+  max_steps:    20,
+  rate_limit:   0,
+  // Agent
+  model:        '',       // per-request model override (empty = use llm_model)
+  refresh:      10,
 };
 
 let cfg = { ...DEFAULT_CFG, ...JSON.parse(localStorage.getItem('epistylion_cfg') || '{}') };
@@ -50,8 +58,12 @@ function toast(msg, type = 'info', ms = 3000) {
 function switchTab(id) {
   document.querySelectorAll('.nav-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === id));
   document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.id === `tab-${id}`));
-  if (id === 'metrics') loadMetrics();
-  if (id === 'tools')   loadTools();
+  if (id === 'metrics')  loadMetrics();
+  if (id === 'tools')    loadTools();
+  if (id === 'settings') {
+    // Refresh skills display and LLM backend status from live server
+    if (cfg.url) _fetchAndPopulateBackend();
+  }
 }
 
 function initTabs() {
@@ -234,7 +246,7 @@ async function sendChat() {
   if (sysPrompt) messages.push({ role: 'system', content: sysPrompt });
   messages.push(...chatHistory);
 
-  const payload = { model: cfg.model, messages, stream: useStream };
+  const payload = { model: cfg.model || cfg.llm_model || 'local-model', messages, stream: useStream };
   if (activeSkill) payload.skill = activeSkill;
   if (disabledTools.size) payload.disabled_tools = [...disabledTools];
 
@@ -597,54 +609,141 @@ function initMetrics() {
 // SETTINGS
 // ══════════════════════════════════════════════════════════════════
 
-function initSettings() {
-  el('cfg-url').value     = cfg.url;
-  el('cfg-key').value     = cfg.key;
-  el('cfg-model').value   = cfg.model;
-  el('cfg-refresh').value = cfg.refresh;
+// ── Settings helpers ──────────────────────────────────────────────
 
+/** Populate the LLM Backend fields from a /v1/status snapshot. */
+function _applyStatusToSettings(status) {
+  if (status.llm_backend && status.llm_backend !== '—')
+    el('cfg-llm-url').value   = status.llm_backend;
+  if (status.llm_model   && status.llm_model   !== '—')
+    el('cfg-llm-model').value = status.llm_model;
+  if (status.max_steps != null)
+    el('cfg-max-steps').value  = status.max_steps;
+  if (status.rate_limit_rpm != null)
+    el('cfg-rate-limit').value = status.rate_limit_rpm;
+
+  // Skills — read-only display
+  const skillBox = el('cfg-skills-display');
+  if (status.skills && status.skills.length) {
+    skillBox.innerHTML = status.skills
+      .map(s => `<span class="tool-tag" style="color:var(--amber)">${s}</span>`)
+      .join(' ');
+  } else {
+    skillBox.innerHTML = '<span class="muted" style="font-size:11px">No skills loaded</span>';
+  }
+}
+
+async function _fetchAndPopulateBackend() {
+  if (!cfg.url) return;
+  try {
+    const status = await apiFetch('/v1/status');
+    _applyStatusToSettings(status);
+    toast('Fetched from server', 'ok', 1500);
+  } catch (e) {
+    toast(`Could not fetch: ${e.message}`, 'err');
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════
+// SETTINGS
+// ══════════════════════════════════════════════════════════════════
+
+function initSettings() {
+  // ── Populate fields from localStorage ──────────────────────────
+  el('cfg-url').value        = cfg.url;
+  el('cfg-key').value        = cfg.key;
+  el('cfg-llm-url').value    = cfg.llm_url;
+  el('cfg-llm-model').value  = cfg.llm_model;
+  el('cfg-llm-key').value    = cfg.llm_key;
+  el('cfg-max-steps').value  = cfg.max_steps;
+  el('cfg-rate-limit').value = cfg.rate_limit;
+  el('cfg-model').value      = cfg.model;
+  el('cfg-refresh').value    = cfg.refresh;
+
+  // ── Save & Apply ───────────────────────────────────────────────
   el('save-settings-btn').addEventListener('click', async () => {
+    // Connection
     cfg.url     = el('cfg-url').value.trim().replace(/\/$/, '');
     cfg.key     = el('cfg-key').value.trim();
-    cfg.model   = el('cfg-model').value.trim() || 'local-model';
+    // LLM Backend
+    cfg.llm_url    = el('cfg-llm-url').value.trim().replace(/\/$/, '');
+    cfg.llm_model  = el('cfg-llm-model').value.trim();
+    cfg.llm_key    = el('cfg-llm-key').value.trim();
+    cfg.max_steps  = parseInt(el('cfg-max-steps').value)  || 20;
+    cfg.rate_limit = parseInt(el('cfg-rate-limit').value) || 0;
+    // Agent
+    cfg.model   = el('cfg-model').value.trim();
     cfg.refresh = parseInt(el('cfg-refresh').value) || 10;
     saveCfg();
+
     el('status-url').textContent = cfg.url || '—';
 
-    // push model override to the server so it uses the new model immediately
+    // Push LLM backend config to server (best-effort)
     if (cfg.url) {
+      const patch = {};
+      if (cfg.llm_url)   patch.base_url   = cfg.llm_url;
+      if (cfg.llm_model) patch.model      = cfg.llm_model;
+      if (cfg.llm_key)   patch.llm_api_key = cfg.llm_key;
+      if (cfg.max_steps) patch.max_steps  = cfg.max_steps;
+      patch.rate_limit = cfg.rate_limit;
+      // Per-request model override
+      if (cfg.model)     patch.agent_model = cfg.model;
       try {
         await apiFetch('/v1/config', {
           method: 'PATCH',
-          body: JSON.stringify({ model: cfg.model }),
+          body:   JSON.stringify(patch),
         });
-      } catch (_) { /* server may not have restarted yet — ignore */ }
+      } catch (_) { /* server may not be up yet — silently ignore */ }
     }
 
     const msg = el('settings-saved-msg');
     msg.classList.remove('hidden');
     setTimeout(() => msg.classList.add('hidden'), 2000);
-    toast('Saved — connecting…', 'ok', 2000);
+    toast('Saved & applied', 'ok', 2000);
     loadDashboard();
     switchTab('dashboard');
   });
 
+  // ── Reset ──────────────────────────────────────────────────────
   el('reset-settings-btn').addEventListener('click', () => {
     cfg = { ...DEFAULT_CFG };
     saveCfg();
-    el('cfg-url').value     = cfg.url;
-    el('cfg-key').value     = cfg.key;
-    el('cfg-model').value   = cfg.model;
-    el('cfg-refresh').value = cfg.refresh;
+    el('cfg-url').value        = cfg.url;
+    el('cfg-key').value        = cfg.key;
+    el('cfg-llm-url').value    = cfg.llm_url;
+    el('cfg-llm-model').value  = cfg.llm_model;
+    el('cfg-llm-key').value    = cfg.llm_key;
+    el('cfg-max-steps').value  = cfg.max_steps;
+    el('cfg-rate-limit').value = cfg.rate_limit;
+    el('cfg-model').value      = cfg.model;
+    el('cfg-refresh').value    = cfg.refresh;
     toast('Reset to defaults', 'info', 2000);
   });
 
+  // ── Console key visibility toggle ──────────────────────────────
   el('toggle-key-vis').addEventListener('click', () => {
-    const inp = el('cfg-key');
+    const inp  = el('cfg-key');
     const show = inp.type === 'password';
-    inp.type = show ? 'text' : 'password';
+    inp.type   = show ? 'text' : 'password';
     el('toggle-key-vis').textContent = show ? 'Hide' : 'Show';
   });
+
+  // ── LLM key visibility toggle ───────────────────────────────────
+  el('toggle-llm-key-vis').addEventListener('click', () => {
+    const inp  = el('cfg-llm-key');
+    const show = inp.type === 'password';
+    inp.type   = show ? 'text' : 'password';
+    el('toggle-llm-key-vis').textContent = show ? 'Hide' : 'Show';
+  });
+
+  // ── Fetch from server button ────────────────────────────────────
+  el('fetch-backend-btn').addEventListener('click', _fetchAndPopulateBackend);
+
+  // Auto-populate LLM backend fields when switching to Settings
+  // (only if they are empty, so we don't overwrite user edits)
+  if (cfg.url && !cfg.llm_url && !cfg.llm_model) {
+    _fetchAndPopulateBackend();
+  }
 }
 
 // ══════════════════════════════════════════════════════════════════

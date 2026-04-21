@@ -838,7 +838,7 @@ canvas { display: block; width: 100% !important; }
 
 /* ── Settings ───────────────────────────────────────────────────── */
 .settings-form {
-  max-width: 600px;
+  max-width: 640px;
   display: flex;
   flex-direction: column;
   gap: 28px;
@@ -859,12 +859,34 @@ canvas { display: block; width: 100% !important; }
 
 .field { display: flex; flex-direction: column; gap: 6px; }
 
+/* Two fields side by side */
+.field-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+}
+
+@media (max-width: 560px) {
+  .field-row { grid-template-columns: 1fr; }
+}
+
 .field label {
   font-size: 11px;
   font-weight: 500;
   letter-spacing: .05em;
   color: var(--text-dim);
   text-transform: uppercase;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.field-optional {
+  font-weight: 400;
+  letter-spacing: 0;
+  text-transform: none;
+  font-size: 10px;
+  color: var(--muted);
 }
 
 .field input[type="text"],
@@ -892,6 +914,16 @@ canvas { display: block; width: 100% !important; }
   padding: 0 4px;
   border-radius: 2px;
   color: var(--amber-bright);
+}
+
+/* Skills read-only pill list */
+.skills-readonly-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-height: 26px;
+  align-items: center;
+  padding: 6px 0;
 }
 
 .input-row {
