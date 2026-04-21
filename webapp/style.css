@@ -957,7 +957,77 @@ canvas { display: block; width: 100% !important; }
   to   { opacity: 1; transform: translateX(0); }
 }
 
-/* ── Responsive ─────────────────────────────────────────────────── */
+/* ── Tool enable toggle (per-card function-call switch) ─────────── */
+.tool-enable-toggle {
+  display: inline-flex;
+  align-items: center;
+  cursor: pointer;
+  flex-shrink: 0;
+  margin-right: 8px;
+  padding: 4px;
+  border-radius: var(--radius);
+}
+
+.tool-enable-toggle input { display: none; }
+
+.tool-toggle-track {
+  width: 26px;
+  height: 13px;
+  background: var(--border-2);
+  border-radius: 7px;
+  position: relative;
+  transition: background .2s;
+  border: 1px solid var(--border-2);
+}
+
+.tool-toggle-track::after {
+  content: '';
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 7px;
+  height: 7px;
+  background: var(--muted);
+  border-radius: 50%;
+  transition: var(--transition);
+}
+
+.tool-enable-toggle input:checked ~ .tool-toggle-track {
+  background: rgba(240,160,0,.25);
+  border-color: var(--amber-dim);
+}
+
+.tool-enable-toggle input:checked ~ .tool-toggle-track::after {
+  left: 15px;
+  background: var(--amber);
+}
+
+.tool-enable-toggle:hover .tool-toggle-track {
+  border-color: var(--amber-dim);
+}
+
+/* tool card dimmed when disabled */
+.tool-card.tool-disabled {
+  opacity: .38;
+}
+.tool-card.tool-disabled .tool-card-name {
+  color: var(--muted-2);
+  text-decoration: line-through;
+  text-decoration-color: var(--muted);
+}
+
+/* badge showing how many tools are disabled */
+.disabled-badge {
+  background: rgba(255,77,77,.12);
+  border: 1px solid rgba(255,77,77,.3);
+  border-radius: 10px;
+  color: var(--red);
+  font-size: 10px;
+  padding: 2px 10px;
+  letter-spacing: .04em;
+}
+
+
 @media (max-width: 900px) {
   .grid-4 { grid-template-columns: 1fr 1fr; }
   .two-col { grid-template-columns: 1fr; }

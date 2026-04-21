@@ -19,6 +19,15 @@ function saveCfg() {
   localStorage.setItem('epistylion_cfg', JSON.stringify(cfg));
 }
 
+// ── Disabled tools (per-tool function-call toggle) ─────────────────
+let disabledTools = new Set(JSON.parse(localStorage.getItem('epistylion_disabled_tools') || '[]'));
+
+function saveDisabledTools() {
+  localStorage.setItem('epistylion_disabled_tools', JSON.stringify([...disabledTools]));
+}
+
+function isToolEnabled(name) { return !disabledTools.has(name); }
+
 // ── API helpers ───────────────────────────────────────────────────
 async function apiFetch(path, opts = {}) {
   const headers = { 'Content-Type': 'application/json' };
@@ -227,6 +236,7 @@ async function sendChat() {
 
   const payload = { model: cfg.model, messages, stream: useStream };
   if (activeSkill) payload.skill = activeSkill;
+  if (disabledTools.size) payload.disabled_tools = [...disabledTools];
 
   const body    = JSON.stringify(payload);
   const headers = { 'Content-Type': 'application/json' };
@@ -386,6 +396,7 @@ function renderTools(tools) {
     const req   = fn.parameters?.required || [];
     const serverMatch = name.match(/^(.+?)__/);
     const serverLabel = serverMatch ? serverMatch[1] : 'unknown';
+    const enabled = isToolEnabled(name);
 
     const propRows = Object.entries(props).map(([k, v]) =>
       `<tr>
@@ -395,13 +406,17 @@ function renderTools(tools) {
     ).join('');
 
     const card = document.createElement('div');
-    card.className = 'tool-card';
+    card.className = `tool-card${enabled ? '' : ' tool-disabled'}`;
     card.innerHTML = `
       <div class="tool-card-header">
-        <div>
+        <div style="flex:1;min-width:0">
           <div class="tool-card-name">${name}</div>
           <div class="tool-card-server">${serverLabel}</div>
         </div>
+        <label class="tool-enable-toggle" title="${enabled ? 'Enabled — click to exclude from function calls' : 'Disabled — click to include in function calls'}">
+          <input type="checkbox" ${enabled ? 'checked' : ''} data-tool="${name}">
+          <span class="tool-toggle-track"></span>
+        </label>
         <span class="tool-card-chevron">▶</span>
       </div>
       <div class="tool-card-body">
@@ -416,12 +431,49 @@ function renderTools(tools) {
         </div>
       </div>
     `;
+
+    // toggle: stop label click from propagating to card-header (which would expand card)
+    const toggleLabel = card.querySelector('.tool-enable-toggle');
+    const toggleInput = card.querySelector('.tool-enable-toggle input');
+    toggleLabel.addEventListener('click', e => e.stopPropagation());
+    toggleInput.addEventListener('change', e => {
+      const on = e.target.checked;
+      if (on) disabledTools.delete(name); else disabledTools.add(name);
+      saveDisabledTools();
+      card.classList.toggle('tool-disabled', !on);
+      toggleLabel.title = on
+        ? 'Enabled — click to exclude from function calls'
+        : 'Disabled — click to include in function calls';
+      // update disabled count badge
+      _updateDisabledBadge();
+      toast(on ? `${name} enabled` : `${name} disabled`, 'info', 1200);
+    });
+
     card.querySelector('.tool-card-header').addEventListener('click', () => card.classList.toggle('open'));
     card.querySelector('.copy-json-btn').addEventListener('click', e => {
       e.stopPropagation();
       navigator.clipboard.writeText(JSON.stringify(t, null, 2)).then(() => toast(`Copied ${name}`, 'ok', 1500));
     });
     grid.appendChild(card);
+  }
+  _updateDisabledBadge();
+}
+
+function _updateDisabledBadge() {
+  const count = disabledTools.size;
+  let badge = el('tools-disabled-badge');
+  if (!badge) {
+    badge = document.createElement('span');
+    badge.id = 'tools-disabled-badge';
+    badge.className = 'disabled-badge';
+    const hdr = document.querySelector('#tab-tools .header-actions');
+    if (hdr) hdr.prepend(badge);
+  }
+  if (count > 0) {
+    badge.textContent = `${count} disabled`;
+    badge.style.display = '';
+  } else {
+    badge.style.display = 'none';
   }
 }
 
@@ -551,13 +603,24 @@ function initSettings() {
   el('cfg-model').value   = cfg.model;
   el('cfg-refresh').value = cfg.refresh;
 
-  el('save-settings-btn').addEventListener('click', () => {
+  el('save-settings-btn').addEventListener('click', async () => {
     cfg.url     = el('cfg-url').value.trim().replace(/\/$/, '');
     cfg.key     = el('cfg-key').value.trim();
     cfg.model   = el('cfg-model').value.trim() || 'local-model';
     cfg.refresh = parseInt(el('cfg-refresh').value) || 10;
     saveCfg();
     el('status-url').textContent = cfg.url || '—';
+
+    // push model override to the server so it uses the new model immediately
+    if (cfg.url) {
+      try {
+        await apiFetch('/v1/config', {
+          method: 'PATCH',
+          body: JSON.stringify({ model: cfg.model }),
+        });
+      } catch (_) { /* server may not have restarted yet — ignore */ }
+    }
+
     const msg = el('settings-saved-msg');
     msg.classList.remove('hidden');
     setTimeout(() => msg.classList.add('hidden'), 2000);

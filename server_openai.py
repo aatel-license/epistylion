@@ -367,6 +367,10 @@ class OpenAIProxyServer:
         self._max_steps        = max_steps
         self._expose_tool_calls = expose_tool_calls
         self._bridge: MCPBridge | None = None
+        # Runtime-mutable model: updated via PATCH /v1/config or per-request body
+        self._current_model: str = config.llm.model
+        # Server-side disabled tool set: kept in sync via PATCH /v1/tools/state
+        self._disabled_tools: set[str] = set()
 
     # ── factory ───────────────────────────────────────────────────────────────
 
@@ -446,6 +450,8 @@ class OpenAIProxyServer:
                 Route("/v1/models",           self._handle_models,      methods=["GET"]),
                 Route("/v1/skills",           self._handle_skills,      methods=["GET"]),
                 Route("/v1/tools",            self._handle_tools,       methods=["GET"]),
+                Route("/v1/tools/state",      self._handle_tools_state, methods=["GET", "PATCH", "OPTIONS"]),
+                Route("/v1/config",           self._handle_config,      methods=["PATCH", "OPTIONS"]),
                 Route("/v1/status",           self._handle_status,      methods=["GET"]),
                 Route("/metrics",             self._handle_metrics,     methods=["GET"]),
                 Route("/health",              self._handle_health,      methods=["GET"]),
@@ -465,8 +471,18 @@ class OpenAIProxyServer:
 
         messages: list[dict[str, Any]] = body.get("messages", [])
         stream:   bool                 = bool(body.get("stream", False))
-        model     = body.get("model", self._config.llm.model)
+        model     = body.get("model") or self._current_model
         skill     = body.get("skill")  # skill da iniettare nel system prompt
+        # Per-request disabled tools merged with server-side set
+        req_disabled: set[str] = set(body.get("disabled_tools") or [])
+        effective_disabled = self._disabled_tools | req_disabled
+
+        # Persist model override so subsequent requests and /v1/status reflect it
+        if model and model != self._current_model:
+            self._current_model = model
+            self._config.llm.model = model
+            if self._bridge:
+                self._bridge._config.llm.model = model
 
         history, user_message = self._parse_messages(messages, req_id)
 
@@ -488,14 +504,14 @@ class OpenAIProxyServer:
         if stream:
             _metrics.stream_requests += 1
             return StreamingResponse(
-                self._stream_completion(user_message, history, body, req_id, skill),
+                self._stream_completion(user_message, history, body, req_id, skill, effective_disabled),
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control":     "no-cache",
                     "X-Accel-Buffering": "no",
                 },
             )
-        return await self._blocking_completion(user_message, history, body, req_id, skill)
+        return await self._blocking_completion(user_message, history, body, req_id, skill, effective_disabled)
 
     # ── completions blocking ──────────────────────────────────────────────────
 
@@ -506,11 +522,14 @@ class OpenAIProxyServer:
         body:         dict[str, Any],
         req_id:       str,
         skill:        str | None = None,
+        disabled_tools: set[str] | None = None,
     ) -> JSONResponse:
         assert self._bridge is not None
         t0 = time.perf_counter()
 
         try:
+            # TODO: pass disabled_tools to agent.run() once agent.py supports the parameter
+            # e.g.: response = await self._bridge.agent.run(user_message, history, skill=skill, disabled_tools=disabled_tools)
             response = await self._bridge.agent.run(user_message, history, skill=skill)
         except Exception as exc:
             logger.error(
@@ -565,6 +584,7 @@ class OpenAIProxyServer:
         body:         dict[str, Any],
         req_id:       str,
         skill:        str | None = None,
+        disabled_tools: set[str] | None = None,
     ) -> AsyncIterator[str]:
         assert self._bridge is not None
 
@@ -654,6 +674,67 @@ class OpenAIProxyServer:
             "skills": skills,
         })
 
+    # ── handler: PATCH /v1/config ────────────────────────────────────────────
+
+    async def _handle_config(self, request: Request) -> JSONResponse:
+        """
+        Aggiorna la configurazione runtime senza riavvio.
+
+        Body JSON accettato::
+
+            { "model": "new-model-id" }
+
+        Restituisce la configurazione aggiornata.
+        """
+        if request.method == "OPTIONS":
+            return Response(status_code=204)
+        try:
+            body: dict[str, Any] = await request.json()
+        except Exception:
+            return _err(400, "Body JSON non valido", "invalid_request_error")
+
+        updated: dict[str, Any] = {}
+
+        if "model" in body:
+            new_model = str(body["model"]).strip()
+            if new_model:
+                self._current_model = new_model
+                self._config.llm.model = new_model
+                if self._bridge:
+                    self._bridge._config.llm.model = new_model
+                updated["model"] = new_model
+                logger.info("config_model_updated", extra={"model": new_model})
+
+        return JSONResponse({"updated": updated, "current_model": self._current_model})
+
+    # ── handler: GET + PATCH /v1/tools/state ────────────────────────────────
+
+    async def _handle_tools_state(self, request: Request) -> JSONResponse:
+        """
+        GET  → restituisce la lista dei tool disabilitati lato server.
+        PATCH → aggiorna la lista; body: ``{"disabled": ["tool_a", "tool_b"]}``
+
+        Il client può sincronizzare il proprio stato localStorage con questo endpoint.
+        """
+        if request.method == "OPTIONS":
+            return Response(status_code=204)
+
+        if request.method == "PATCH":
+            try:
+                body: dict[str, Any] = await request.json()
+            except Exception:
+                return _err(400, "Body JSON non valido", "invalid_request_error")
+            disabled = body.get("disabled", [])
+            if not isinstance(disabled, list):
+                return _err(400, "'disabled' deve essere una lista di stringhe", "invalid_request_error")
+            self._disabled_tools = set(str(t) for t in disabled)
+            logger.info("tools_state_updated", extra={"disabled_count": len(self._disabled_tools)})
+
+        return JSONResponse({
+            "disabled": sorted(self._disabled_tools),
+            "disabled_count": len(self._disabled_tools),
+        })
+
     # ── handler: /v1/status ─────────────────────────────────────────────────
 
     async def _handle_status(self, request: Request) -> JSONResponse:
@@ -671,7 +752,7 @@ class OpenAIProxyServer:
             "status":          "ok",
             "uptime_s":        round(time.time() - _metrics.started_at, 1),
             "llm_backend":     self._config.llm.base_url,
-            "llm_model":       self._config.llm.model,
+            "llm_model":       self._current_model,
             "max_steps":       self._max_steps,
             "auth_enabled":    bool(_API_KEY),
             "rate_limit_rpm":  _RATE_LIMIT,
