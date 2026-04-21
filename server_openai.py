@@ -458,6 +458,64 @@ class OpenAIProxyServer:
             ],
         )
 
+    # ── tool filtering context ────────────────────────────────────────────────
+
+    async def _run_with_filtered_tools(
+        self,
+        user_message:    str,
+        history:         list[AgentMessage],
+        skill:           str | None,
+        disabled_tools:  set[str],
+    ):
+        """
+        Temporarily wrap ``bridge.get_openai_tools`` so that any tool whose
+        qualified name is in *disabled_tools* is silently removed from the list
+        the agent sends to the LLM.  The original method is restored even if an
+        exception is raised.
+        """
+        assert self._bridge is not None
+        if not disabled_tools:
+            return await self._bridge.agent.run(user_message, history, skill=skill)
+
+        original_get_tools = self._bridge.get_openai_tools
+
+        def _filtered(**kw):
+            tools = original_get_tools(**kw)
+            return [t for t in tools if t.get("function", {}).get("name") not in disabled_tools]
+
+        self._bridge.get_openai_tools = _filtered  # type: ignore[assignment]
+        try:
+            return await self._bridge.agent.run(user_message, history, skill=skill)
+        finally:
+            self._bridge.get_openai_tools = original_get_tools  # type: ignore[assignment]
+
+    async def _stream_with_filtered_tools(
+        self,
+        user_message:   str,
+        history:        list[AgentMessage],
+        skill:          str | None,
+        disabled_tools: set[str],
+    ):
+        """Streaming variant of ``_run_with_filtered_tools``."""
+        assert self._bridge is not None
+        if not disabled_tools:
+            async for chunk in self._bridge.agent.stream(user_message, history, skill=skill):
+                yield chunk
+            return
+
+        original_get_tools = self._bridge.get_openai_tools
+
+        def _filtered(**kw):
+            tools = original_get_tools(**kw)
+            return [t for t in tools if t.get("function", {}).get("name") not in disabled_tools]
+
+        self._bridge.get_openai_tools = _filtered  # type: ignore[assignment]
+        try:
+            async for chunk in self._bridge.agent.stream(user_message, history, skill=skill):
+                yield chunk
+        finally:
+            self._bridge.get_openai_tools = original_get_tools  # type: ignore[assignment]
+
     # ── handler: /v1/chat/completions ─────────────────────────────────────────
 
     async def _handle_completions(self, request: Request) -> Response:
@@ -528,9 +586,9 @@ class OpenAIProxyServer:
         t0 = time.perf_counter()
 
         try:
-            # TODO: pass disabled_tools to agent.run() once agent.py supports the parameter
-            # e.g.: response = await self._bridge.agent.run(user_message, history, skill=skill, disabled_tools=disabled_tools)
-            response = await self._bridge.agent.run(user_message, history, skill=skill)
+            response = await self._run_with_filtered_tools(
+                user_message, history, skill=skill, disabled_tools=disabled_tools or set(),
+            )
         except Exception as exc:
             logger.error(
                 "agent_error",
@@ -609,7 +667,9 @@ class OpenAIProxyServer:
             }) + "\n\n"
 
         try:
-            async for text in self._bridge.agent.stream(user_message, history, skill=skill):
+            async for text in self._stream_with_filtered_tools(
+                user_message, history, skill=skill, disabled_tools=disabled_tools or set()
+            ):
                 chunks += 1
                 yield _chunk(text)
         except Exception as exc:
@@ -655,13 +715,17 @@ class OpenAIProxyServer:
         """Lista tutti i tool MCP nel formato OpenAI function-calling."""
         assert self._bridge is not None
         qualified = request.query_params.get("qualified", "false").lower() == "true"
-        tools  = self._bridge.get_openai_tools(use_qualified_names=qualified)
-        summary = self._bridge.registry.summary()
+        show_all  = request.query_params.get("show_disabled", "true").lower() == "true"
+        tools     = self._bridge.get_openai_tools(use_qualified_names=qualified)
+        if not show_all and self._disabled_tools:
+            tools = [t for t in tools if t.get("function", {}).get("name") not in self._disabled_tools]
+        summary   = self._bridge.registry.summary()
         return JSONResponse({
-            "object":     "list",
-            "count":      len(tools),
-            "by_server":  summary,
-            "tools":      tools,
+            "object":    "list",
+            "count":     len(tools),
+            "by_server": summary,
+            "tools":     tools,
+            "disabled":  sorted(self._disabled_tools),
         })
 
     # ── handler: /v1/skills ─────────────────────────────────────────────────

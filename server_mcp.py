@@ -419,6 +419,9 @@ class MCPProxyServer:
             for entry in entries:
                 tool = entry.tool
                 name = entry.qualified_name if self._use_qualified_names else tool.name
+                # Skip tools disabled server-side
+                if name in self._disabled_tools:
+                    continue
                 result.append(Tool(
                     name=name,
                     description=tool.description or f"Tool dal server '{entry.server_name}'",

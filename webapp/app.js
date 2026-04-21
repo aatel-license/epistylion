@@ -60,10 +60,9 @@ function switchTab(id) {
   document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.id === `tab-${id}`));
   if (id === 'metrics')  loadMetrics();
   if (id === 'tools')    loadTools();
-  if (id === 'settings') {
-    // Refresh skills display and LLM backend status from live server
-    if (cfg.url) _fetchAndPopulateBackend();
-  }
+  // Settings: just re-populate fields from cfg (localStorage) — no server fetch.
+  // Use the "Fetch from server" button to pull live values explicitly.
+  if (id === 'settings') _populateSettingsFromCfg();
 }
 
 function initTabs() {
@@ -350,14 +349,15 @@ function initChat() {
 // TOOLS
 // ══════════════════════════════════════════════════════════════════
 
-let allTools = [], activeServer = 'all';
+let allTools = [], activeServer = 'all', byServerMap = {};
 
 async function loadTools() {
   const qualified = el('qualified-toggle').checked;
   try {
     const data = await apiFetch(`/v1/tools${qualified ? '?qualified=true' : ''}`);
-    allTools = data.tools || [];
-    buildServerTabs(data.by_server || {});
+    allTools    = data.tools || [];
+    byServerMap = data.by_server || {};
+    buildServerTabs(byServerMap);
     renderTools(allTools);
   } catch (e) {
     toast(`Tools error: ${e.message}`, 'err');
@@ -365,20 +365,94 @@ async function loadTools() {
   }
 }
 
+// ── helpers for server-level bulk disable ─────────────────────────
+
+/** All qualified tool names that belong to a given server entry in byServer. */
+function _serverToolNames(serverName) {
+  return (byServerMap[serverName] || []);
+}
+
+/** True if every tool of a server is in disabledTools. */
+function _isServerDisabled(serverName) {
+  const tools = _serverToolNames(serverName);
+  return tools.length > 0 && tools.every(n => disabledTools.has(n));
+}
+
+/** Enable or disable all tools of a server at once. */
+function _setServerEnabled(serverName, enabled) {
+  for (const name of _serverToolNames(serverName)) {
+    if (enabled) disabledTools.delete(name);
+    else         disabledTools.add(name);
+  }
+  saveDisabledTools();
+}
+
 function buildServerTabs(byServer) {
   const container = el('tools-server-tabs');
   container.innerHTML = '';
+
   for (const s of ['all', ...Object.keys(byServer)]) {
+    const isAll = s === 'all';
+    const count = isAll ? allTools.length : (byServer[s] || []).length;
+    const serverDisabled = !isAll && _isServerDisabled(s);
+
+    const wrap = document.createElement('div');
+    wrap.className = 'server-tab-wrap';
+    wrap.dataset.server = s;
+
+    // ── server label / filter button ────────────────────────────
     const btn = document.createElement('button');
-    btn.className = `server-tab-btn${s === activeServer ? ' active' : ''}`;
-    btn.textContent = s === 'all' ? `All (${allTools.length})` : `${s} (${(byServer[s]||[]).length})`;
+    btn.className = `server-tab-btn${s === activeServer ? ' active' : ''}${(!isAll && serverDisabled) ? ' server-all-disabled' : ''}`;
+    btn.dataset.server = s;
+    btn.textContent = isAll ? `All (${count})` : `${s} (${count})`;
     btn.addEventListener('click', () => {
       activeServer = s;
       document.querySelectorAll('.server-tab-btn').forEach(b => b.classList.remove('active'));
       btn.classList.add('active');
       filterTools();
     });
-    container.appendChild(btn);
+    wrap.appendChild(btn);
+
+    // ── per-server enable/disable toggle (not on "All" tab) ─────
+    if (!isAll) {
+      const tog = document.createElement('label');
+      tog.className = 'server-toggle';
+      tog.title = serverDisabled
+        ? `Enable all ${s} tools`
+        : `Disable all ${s} tools`;
+
+      const inp = document.createElement('input');
+      inp.type    = 'checkbox';
+      inp.checked = !serverDisabled;
+      inp.dataset.server = s;
+
+      const track = document.createElement('span');
+      track.className = 'server-toggle-track';
+
+      tog.appendChild(inp);
+      tog.appendChild(track);
+
+      tog.addEventListener('click', e => e.stopPropagation());
+      inp.addEventListener('change', e => {
+        const enabled = e.target.checked;
+        _setServerEnabled(s, enabled);
+        _updateDisabledBadge();
+
+        // update pill appearance
+        btn.classList.toggle('server-all-disabled', !enabled);
+        tog.title = enabled ? `Disable all ${s} tools` : `Enable all ${s} tools`;
+
+        // re-render so individual card toggles reflect the new state
+        filterTools();
+        toast(
+          enabled ? `${s}: all tools enabled` : `${s}: all tools disabled`,
+          'info', 1800,
+        );
+      });
+      wrap.appendChild(tog);
+    }
+
+    container.appendChild(wrap);
   }
 }
 
@@ -487,6 +561,15 @@ function _updateDisabledBadge() {
   } else {
     badge.style.display = 'none';
   }
+
+  // Keep server-tab toggles in sync when individual tool cards are toggled
+  document.querySelectorAll('.server-toggle input[data-server]').forEach(inp => {
+    const s = inp.dataset.server;
+    const allDisabled = _isServerDisabled(s);
+    inp.checked = !allDisabled;
+    const btn = document.querySelector(`.server-tab-btn[data-server="${s}"]`);
+    if (btn) btn.classList.toggle('server-all-disabled', allDisabled);
+  });
 }
 
 function initTools() {
@@ -611,18 +694,25 @@ function initMetrics() {
 
 // ── Settings helpers ──────────────────────────────────────────────
 
-/** Populate the LLM Backend fields from a /v1/status snapshot. */
+/** Populate the LLM Backend fields from a /v1/status snapshot.
+ *  Only overwrites fields that are currently empty in the form
+ *  so manual edits are never clobbered. Skills list is always refreshed. */
 function _applyStatusToSettings(status) {
-  if (status.llm_backend && status.llm_backend !== '—')
-    el('cfg-llm-url').value   = status.llm_backend;
-  if (status.llm_model   && status.llm_model   !== '—')
-    el('cfg-llm-model').value = status.llm_model;
-  if (status.max_steps != null)
-    el('cfg-max-steps').value  = status.max_steps;
-  if (status.rate_limit_rpm != null)
-    el('cfg-rate-limit').value = status.rate_limit_rpm;
+  const urlField   = el('cfg-llm-url');
+  const modelField = el('cfg-llm-model');
+  const stepsField = el('cfg-max-steps');
+  const rlField    = el('cfg-rate-limit');
 
-  // Skills — read-only display
+  if (!urlField.value   && status.llm_backend && status.llm_backend !== '—')
+    urlField.value   = status.llm_backend;
+  if (!modelField.value && status.llm_model   && status.llm_model   !== '—')
+    modelField.value = status.llm_model;
+  if (!stepsField.value && status.max_steps != null)
+    stepsField.value = status.max_steps;
+  if (!rlField.value    && status.rate_limit_rpm != null)
+    rlField.value    = status.rate_limit_rpm;
+
+  // Skills — always refresh (read-only display)
   const skillBox = el('cfg-skills-display');
   if (status.skills && status.skills.length) {
     skillBox.innerHTML = status.skills
@@ -633,11 +723,38 @@ function _applyStatusToSettings(status) {
   }
 }
 
-async function _fetchAndPopulateBackend() {
+/** Populate every Settings input from the current in-memory cfg object. */
+function _populateSettingsFromCfg() {
+  el('cfg-url').value        = cfg.url;
+  el('cfg-key').value        = cfg.key;
+  el('cfg-llm-url').value    = cfg.llm_url;
+  el('cfg-llm-model').value  = cfg.llm_model;
+  el('cfg-llm-key').value    = cfg.llm_key;
+  el('cfg-max-steps').value  = cfg.max_steps;
+  el('cfg-rate-limit').value = cfg.rate_limit;
+  el('cfg-model').value      = cfg.model;
+  el('cfg-refresh').value    = cfg.refresh;
+}
+
+async function _fetchAndPopulateBackend(force = false) {
   if (!cfg.url) return;
   try {
     const status = await apiFetch('/v1/status');
-    _applyStatusToSettings(status);
+    if (force) {
+      // Explicit button press — overwrite all LLM backend fields unconditionally
+      if (status.llm_backend && status.llm_backend !== '—') el('cfg-llm-url').value   = status.llm_backend;
+      if (status.llm_model   && status.llm_model   !== '—') el('cfg-llm-model').value = status.llm_model;
+      if (status.max_steps   != null) el('cfg-max-steps').value  = status.max_steps;
+      if (status.rate_limit_rpm != null) el('cfg-rate-limit').value = status.rate_limit_rpm;
+      const skillBox = el('cfg-skills-display');
+      if (status.skills && status.skills.length) {
+        skillBox.innerHTML = status.skills.map(s => `<span class="tool-tag" style="color:var(--amber)">${s}</span>`).join(' ');
+      } else {
+        skillBox.innerHTML = '<span class="muted" style="font-size:11px">No skills loaded</span>';
+      }
+    } else {
+      _applyStatusToSettings(status);   // only fills empty fields
+    }
     toast('Fetched from server', 'ok', 1500);
   } catch (e) {
     toast(`Could not fetch: ${e.message}`, 'err');
@@ -650,15 +767,7 @@ async function _fetchAndPopulateBackend() {
 
 function initSettings() {
   // ── Populate fields from localStorage ──────────────────────────
-  el('cfg-url').value        = cfg.url;
-  el('cfg-key').value        = cfg.key;
-  el('cfg-llm-url').value    = cfg.llm_url;
-  el('cfg-llm-model').value  = cfg.llm_model;
-  el('cfg-llm-key').value    = cfg.llm_key;
-  el('cfg-max-steps').value  = cfg.max_steps;
-  el('cfg-rate-limit').value = cfg.rate_limit;
-  el('cfg-model').value      = cfg.model;
-  el('cfg-refresh').value    = cfg.refresh;
+  _populateSettingsFromCfg();
 
   // ── Save & Apply ───────────────────────────────────────────────
   el('save-settings-btn').addEventListener('click', async () => {
@@ -708,15 +817,7 @@ function initSettings() {
   el('reset-settings-btn').addEventListener('click', () => {
     cfg = { ...DEFAULT_CFG };
     saveCfg();
-    el('cfg-url').value        = cfg.url;
-    el('cfg-key').value        = cfg.key;
-    el('cfg-llm-url').value    = cfg.llm_url;
-    el('cfg-llm-model').value  = cfg.llm_model;
-    el('cfg-llm-key').value    = cfg.llm_key;
-    el('cfg-max-steps').value  = cfg.max_steps;
-    el('cfg-rate-limit').value = cfg.rate_limit;
-    el('cfg-model').value      = cfg.model;
-    el('cfg-refresh').value    = cfg.refresh;
+    _populateSettingsFromCfg();
     toast('Reset to defaults', 'info', 2000);
   });
 
@@ -737,7 +838,7 @@ function initSettings() {
   });
 
   // ── Fetch from server button ────────────────────────────────────
-  el('fetch-backend-btn').addEventListener('click', _fetchAndPopulateBackend);
+  el('fetch-backend-btn').addEventListener('click', () => _fetchAndPopulateBackend(true));
 
   // Auto-populate LLM backend fields when switching to Settings
   // (only if they are empty, so we don't overwrite user edits)
