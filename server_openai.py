@@ -421,6 +421,7 @@ class OpenAIProxyServer:
             app, host=host, port=port,
             log_config=None,   # disabilitiamo il logger uvicorn, usiamo il nostro
             access_log=False,
+            reload=True,
         )
         server = uvicorn.Server(cfg)
         try:
@@ -759,7 +760,7 @@ class OpenAIProxyServer:
                     extra={"req_id": req_id, "length": len(content)},
                 )
                 if self._bridge and self._bridge._agent:
-                    self._bridge._agent._system_prompt = content
+                    self._bridge._agent._base_system_prompt = content
                 continue
 
             if role == "user":

@@ -51,6 +51,7 @@ class AgentMessage:
     content:      str
     tool_call_id: str | None = None
     tool_name:    str | None = None
+    tool_calls:   list[dict[str, Any]] = field(default_factory=list)  # AGGIUNTO
 
 
 @dataclass
@@ -310,6 +311,15 @@ class MCPAgent:
             {"role": "system", "content": system_prompt}
         ]
 
+        # for h in history:
+        #     if h.role == "tool":
+        #         messages.append({
+        #             "role":         "tool",
+        #             "tool_call_id": h.tool_call_id or "",
+        #             "content":      h.content,
+        #         })
+        #     else:
+        #         messages.append({"role": h.role, "content": h.content})  # type: ignore[arg-type]
         for h in history:
             if h.role == "tool":
                 messages.append({
@@ -317,8 +327,17 @@ class MCPAgent:
                     "tool_call_id": h.tool_call_id or "",
                     "content":      h.content,
                 })
+            elif h.role == "assistant" and h.tool_name:
+                # Ricostruzione parziale — non hai i tool_calls completi in AgentMessage
+                # soluzione: vedi sotto
+                messages.append({"role": "assistant", "content": h.content or ""})
+            elif h.role == "assistant":
+                msg: dict[str, Any] = {"role": "assistant", "content": h.content or ""}
+                if h.tool_calls:
+                    msg["tool_calls"] = h.tool_calls
+                messages.append(msg)
             else:
-                messages.append({"role": h.role, "content": h.content})  # type: ignore[arg-type]
+                messages.append({"role": h.role, "content": h.content})
 
         messages.append({"role": "user", "content": user_message})
         return messages
@@ -332,7 +351,7 @@ class MCPAgent:
         }
         if self._openai_tools:
             kwargs["tools"]       = self._openai_tools
-            kwargs["tool_choice"] = "auto"
+            # kwargs["tool_choice"] = "auto"
 
         return await self._openai.chat.completions.create(**kwargs)
 
