@@ -409,13 +409,24 @@ class MCPAgent:
                 suggestion=f"Verifica la chiave API per {provider}. Controlla LLM_API_KEY nel file .env",
             )
         except OpenAIRateLimitError as e:
+            # Determina il provider per il logging
+            rate_provider = "unknown"
+            if hasattr(self._llm_config, 'base_url'):
+                base_url = self._llm_config.base_url or ""
+                if "openrouter" in base_url:
+                    rate_provider = "openrouter"
+                elif "inclusionai" in base_url:
+                    rate_provider = "inclusionai"
+                elif "sambanova" in base_url:
+                    rate_provider = "sambanova"
+            
             retry_after = None
             if hasattr(e, 'retry_after'):
                 retry_after = int(e.retry_after) if e.retry_after else None
             
             logger.warning(
                 "Rate limit hit calling LLM",
-                extra={"provider": provider, "retry_after": retry_after},
+                extra={"provider": rate_provider, "retry_after": retry_after},
             )
             raise RateLimitError(
                 message=str(e),
