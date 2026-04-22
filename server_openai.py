@@ -45,16 +45,18 @@ import uuid
 from pathlib import Path
 from typing import Any, AsyncIterator
 
+from openai import AsyncOpenAI
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from starlette.responses import JSONResponse, Response, StreamingResponse
+from starlette.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
 from agent import AgentMessage
 from epistylion import MCPBridge
 from config import BridgeConfig, load_config
+from exceptions import AuthenticationError, RateLimitError, ModelNotFoundError
 
 # ── logging strutturato ────────────────────────────────────────────────────────
 
@@ -326,7 +328,7 @@ class CORSMiddleware(BaseHTTPMiddleware):
                 status_code=204,
                 headers={
                     "Access-Control-Allow-Origin":  origin_hdr,
-                    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+                    "Access-Control-Allow-Methods": "GET, POST, OPTIONS, PATCH",
                     "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Api-Key",
                     "Access-Control-Max-Age":       "86400",
                 },
@@ -362,15 +364,15 @@ class OpenAIProxyServer:
         max_steps: int = 20,
         expose_tool_calls: bool = False,
     ) -> None:
-        self._config           = config
-        self._system_prompt    = system_prompt
-        self._max_steps        = max_steps
+        self._config            = config
+        self._system_prompt     = system_prompt
+        self._max_steps         = max_steps
         self._expose_tool_calls = expose_tool_calls
         self._bridge: MCPBridge | None = None
-        # Runtime-mutable model: updated via PATCH /v1/config or per-request body
-        self._current_model: str = config.llm.model
-        # Server-side disabled tool set: kept in sync via PATCH /v1/tools/state
-        self._disabled_tools: set[str] = set()
+        # Runtime-mutable state (updated via PATCH /v1/config or per-request body)
+        self._current_model:    str      = config.llm.model
+        self._current_base_url: str      = config.llm.base_url
+        self._disabled_tools:   set[str] = set()
 
     # ── factory ───────────────────────────────────────────────────────────────
 
@@ -406,6 +408,19 @@ class OpenAIProxyServer:
             system_prompt=self._system_prompt,
             max_steps=self._max_steps,
         )
+
+        # ── Permanent disabled-tools filter ───────────────────────────────────
+        # Wrap bridge.get_openai_tools ONCE so that self._disabled_tools is
+        # always respected, regardless of how agent.run() calls it internally.
+        _server   = self
+        _orig_get = self._bridge.get_openai_tools
+        def _filtered_get_tools(**kw):
+            tools = _orig_get(**kw)
+            if not _server._disabled_tools:
+                return tools
+            return [t for t in tools
+                    if t.get("function", {}).get("name") not in _server._disabled_tools]
+        self._bridge.get_openai_tools = _filtered_get_tools  # type: ignore[assignment]
 
         tool_count = len(self._bridge.registry.all_entries())
         logger.info(
@@ -446,75 +461,22 @@ class OpenAIProxyServer:
                 Middleware(RateLimitMiddleware),
             ],
             routes=[
+                # Serve webapp static files from root (eliminates CORS issues)
+                Route("/", self._serve_webapp, methods=["GET"]),
+                Route("/index.html", self._serve_webapp, methods=["GET"]),
+                Route("/style.css", self._serve_style_css, methods=["GET"]),
+                Route("/app.js", self._serve_app_js, methods=["GET"]),
+                # API endpoints
                 Route("/v1/chat/completions", self._handle_completions, methods=["POST", "OPTIONS"]),
                 Route("/v1/models",           self._handle_models,      methods=["GET"]),
                 Route("/v1/skills",           self._handle_skills,      methods=["GET"]),
                 Route("/v1/tools",            self._handle_tools,       methods=["GET"]),
-                Route("/v1/tools/state",      self._handle_tools_state, methods=["GET", "PATCH", "OPTIONS"]),
                 Route("/v1/config",           self._handle_config,      methods=["PATCH", "OPTIONS"]),
                 Route("/v1/status",           self._handle_status,      methods=["GET"]),
                 Route("/metrics",             self._handle_metrics,     methods=["GET"]),
                 Route("/health",              self._handle_health,      methods=["GET"]),
             ],
         )
-
-    # ── tool filtering context ────────────────────────────────────────────────
-
-    async def _run_with_filtered_tools(
-        self,
-        user_message:    str,
-        history:         list[AgentMessage],
-        skill:           str | None,
-        disabled_tools:  set[str],
-    ):
-        """
-        Temporarily wrap ``bridge.get_openai_tools`` so that any tool whose
-        qualified name is in *disabled_tools* is silently removed from the list
-        the agent sends to the LLM.  The original method is restored even if an
-        exception is raised.
-        """
-        assert self._bridge is not None
-        if not disabled_tools:
-            return await self._bridge.agent.run(user_message, history, skill=skill)
-
-        original_get_tools = self._bridge.get_openai_tools
-
-        def _filtered(**kw):
-            tools = original_get_tools(**kw)
-            return [t for t in tools if t.get("function", {}).get("name") not in disabled_tools]
-
-        self._bridge.get_openai_tools = _filtered  # type: ignore[assignment]
-        try:
-            return await self._bridge.agent.run(user_message, history, skill=skill)
-        finally:
-            self._bridge.get_openai_tools = original_get_tools  # type: ignore[assignment]
-
-    async def _stream_with_filtered_tools(
-        self,
-        user_message:   str,
-        history:        list[AgentMessage],
-        skill:          str | None,
-        disabled_tools: set[str],
-    ):
-        """Streaming variant of ``_run_with_filtered_tools``."""
-        assert self._bridge is not None
-        if not disabled_tools:
-            async for chunk in self._bridge.agent.stream(user_message, history, skill=skill):
-                yield chunk
-            return
-
-        original_get_tools = self._bridge.get_openai_tools
-
-        def _filtered(**kw):
-            tools = original_get_tools(**kw)
-            return [t for t in tools if t.get("function", {}).get("name") not in disabled_tools]
-
-        self._bridge.get_openai_tools = _filtered  # type: ignore[assignment]
-        try:
-            async for chunk in self._bridge.agent.stream(user_message, history, skill=skill):
-                yield chunk
-        finally:
-            self._bridge.get_openai_tools = original_get_tools  # type: ignore[assignment]
 
     # ── handler: /v1/chat/completions ─────────────────────────────────────────
 
@@ -530,17 +492,37 @@ class OpenAIProxyServer:
         messages: list[dict[str, Any]] = body.get("messages", [])
         stream:   bool                 = bool(body.get("stream", False))
         model     = body.get("model") or self._current_model
-        skill     = body.get("skill")  # skill da iniettare nel system prompt
-        # Per-request disabled tools merged with server-side set
-        req_disabled: set[str] = set(body.get("disabled_tools") or [])
-        effective_disabled = self._disabled_tools | req_disabled
+        skill     = body.get("skill")
 
-        # Persist model override so subsequent requests and /v1/status reflect it
+        # ── sync disabled tools from request body ─────────────────────────────
+        # The client sends the full current set every request; we update the
+        # server-side set so the permanent filter in get_openai_tools picks it up.
+        req_disabled = body.get("disabled_tools")
+        if isinstance(req_disabled, list):
+            self._disabled_tools = set(req_disabled)
+
+        # ── sync base_url if client sends a newer value ───────────────────────
+        req_base_url = (body.get("base_url") or "").strip().rstrip("/")
+        if req_base_url and req_base_url != self._current_base_url:
+            logger.info("Updating base_url from request", extra={"old": self._current_base_url, "new": req_base_url})
+            self._current_base_url       = req_base_url
+            self._config.llm.base_url    = req_base_url
+            if self._bridge and self._bridge._agent:
+                # Direct access to agent instance - update its OpenAI client
+                self._bridge._agent._llm_config.base_url = req_base_url
+                self._bridge._agent._openai = AsyncOpenAI(
+                    base_url=req_base_url,
+                    api_key=self._bridge._agent._llm_config.api_key,
+                )
+                logger.info("Agent OpenAI client recreated with new base_url")
+            else:
+                logger.warning("Cannot access agent to update base_url", extra={"has_bridge": bool(self._bridge), "has_agent": bool(self._bridge._agent if self._bridge else None)})
+
+        # ── sync model ────────────────────────────────────────────────────────
         if model and model != self._current_model:
-            self._current_model = model
-            self._config.llm.model = model
-            if self._bridge:
-                self._bridge._config.llm.model = model
+            self._current_model          = model
+            self._config.llm.model       = model
+            self._bridge._config.llm.model = model
 
         history, user_message = self._parse_messages(messages, req_id)
 
@@ -562,14 +544,14 @@ class OpenAIProxyServer:
         if stream:
             _metrics.stream_requests += 1
             return StreamingResponse(
-                self._stream_completion(user_message, history, body, req_id, skill, effective_disabled),
+                self._stream_completion(user_message, history, body, req_id, skill),
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control":     "no-cache",
                     "X-Accel-Buffering": "no",
                 },
             )
-        return await self._blocking_completion(user_message, history, body, req_id, skill, effective_disabled)
+        return await self._blocking_completion(user_message, history, body, req_id, skill)
 
     # ── completions blocking ──────────────────────────────────────────────────
 
@@ -580,15 +562,42 @@ class OpenAIProxyServer:
         body:         dict[str, Any],
         req_id:       str,
         skill:        str | None = None,
-        disabled_tools: set[str] | None = None,
     ) -> JSONResponse:
         assert self._bridge is not None
         t0 = time.perf_counter()
 
         try:
-            response = await self._run_with_filtered_tools(
-                user_message, history, skill=skill, disabled_tools=disabled_tools or set(),
+            response = await self._bridge.agent.run(user_message, history, skill=skill)
+        except AuthenticationError as exc:
+            # Errore di autenticazione - non tentare nuovamente
+            logger.error(
+                "auth_error_completion",
+                extra={"req_id": req_id, "provider": exc.provider or "unknown"},
             )
+            _metrics.requests_auth_fail += 1
+            
+            # Mostra l'API key configurata per debug
+            current_key = self._config.llm.api_key if hasattr(self._config.llm, 'api_key') else ""
+            error_msg = str(exc) + f"\n[DEBUG] API Key configurata: '{current_key}'"
+            
+            return _err(401, error_msg, "authentication_error")
+        except RateLimitError as exc:
+            # Rate limit raggiunto - suggerire retry
+            logger.warning(
+                "rate_limit_completion",
+                extra={"req_id": req_id, "retry_after": exc.retry_after},
+            )
+            return _err(429, str(exc), "rate_limit_error")
+        except ModelNotFoundError as exc:
+            # Modello non trovato - fornire informazioni utili
+            logger.error(
+                "model_not_found_completion",
+                extra={"req_id": req_id, "model": exc.model},
+            )
+            error_msg = f"Modello '{exc.model}' non trovato sul server LLM"
+            if exc.available_models:
+                error_msg += f"\nModelli disponibili: {', '.join(exc.available_models)}"
+            return _err(400, error_msg, "model_not_found_error")
         except Exception as exc:
             logger.error(
                 "agent_error",
@@ -614,7 +623,7 @@ class OpenAIProxyServer:
             "id":      completion_id,
             "object":  "chat.completion",
             "created": int(time.time()),
-            "model":   body.get("model", self._config.llm.model),
+            "model":   body.get("model") or self._current_model,
             "choices": [{
                 "index":   0,
                 "message": {"role": "assistant", "content": response.final_message},
@@ -642,12 +651,11 @@ class OpenAIProxyServer:
         body:         dict[str, Any],
         req_id:       str,
         skill:        str | None = None,
-        disabled_tools: set[str] | None = None,
     ) -> AsyncIterator[str]:
         assert self._bridge is not None
 
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
-        model   = body.get("model", self._config.llm.model)
+        model   = body.get("model") or self._current_model
         created = int(time.time())
         t0      = time.perf_counter()
         chunks  = 0
@@ -667,11 +675,46 @@ class OpenAIProxyServer:
             }) + "\n\n"
 
         try:
-            async for text in self._stream_with_filtered_tools(
-                user_message, history, skill=skill, disabled_tools=disabled_tools or set()
-            ):
+            async for text in self._bridge.agent.stream(user_message, history, skill=skill):
                 chunks += 1
                 yield _chunk(text)
+        except AuthenticationError as exc:
+            # Errore di autenticazione - non tentare nuovamente
+            logger.error(
+                "auth_error_stream",
+                extra={"req_id": req_id, "provider": exc.provider or "unknown"},
+            )
+            _metrics.requests_auth_fail += 1
+            
+            # Mostra l'API key configurata per debug
+            current_key = self._config.llm.api_key if hasattr(self._config.llm, 'api_key') else ""
+            yield _chunk(f"\n[ERRORE AUTH] {exc.message}\n[DEBUG] API Key configurata: '{current_key}'", finish_reason="stop")
+            yield "data: [DONE]\n\n"
+            return
+        except RateLimitError as exc:
+            # Rate limit raggiunto - suggerire retry
+            logger.warning(
+                "rate_limit_stream",
+                extra={"req_id": req_id, "retry_after": exc.retry_after},
+            )
+            retry_msg = f"\n[ERRORE RATE LIMIT] {exc.message}"
+            if exc.retry_after:
+                retry_msg += f" (riprova dopo {exc.retry_after}s)"
+            yield _chunk(retry_msg, finish_reason="stop")
+            yield "data: [DONE]\n\n"
+            return
+        except ModelNotFoundError as exc:
+            # Modello non trovato - fornire informazioni utili
+            logger.error(
+                "model_not_found_stream",
+                extra={"req_id": req_id, "model": exc.model},
+            )
+            error_msg = f"\n[ERRORE MODELLO] '{exc.model}' non trovato"
+            if exc.available_models:
+                error_msg += f"\nModelli disponibili: {', '.join(exc.available_models)}"
+            yield _chunk(error_msg, finish_reason="stop")
+            yield "data: [DONE]\n\n"
+            return
         except Exception as exc:
             logger.error(
                 "stream_error",
@@ -701,7 +744,7 @@ class OpenAIProxyServer:
         return JSONResponse({
             "object": "list",
             "data": [{
-                "id":          self._config.llm.model,
+                "id":          self._current_model,
                 "object":      "model",
                 "created":     int(time.time()),
                 "owned_by":    "epistylion",
@@ -715,17 +758,13 @@ class OpenAIProxyServer:
         """Lista tutti i tool MCP nel formato OpenAI function-calling."""
         assert self._bridge is not None
         qualified = request.query_params.get("qualified", "false").lower() == "true"
-        show_all  = request.query_params.get("show_disabled", "true").lower() == "true"
-        tools     = self._bridge.get_openai_tools(use_qualified_names=qualified)
-        if not show_all and self._disabled_tools:
-            tools = [t for t in tools if t.get("function", {}).get("name") not in self._disabled_tools]
-        summary   = self._bridge.registry.summary()
+        tools  = self._bridge.get_openai_tools(use_qualified_names=qualified)
+        summary = self._bridge.registry.summary()
         return JSONResponse({
-            "object":    "list",
-            "count":     len(tools),
-            "by_server": summary,
-            "tools":     tools,
-            "disabled":  sorted(self._disabled_tools),
+            "object":     "list",
+            "count":      len(tools),
+            "by_server":  summary,
+            "tools":      tools,
         })
 
     # ── handler: /v1/skills ─────────────────────────────────────────────────
@@ -744,18 +783,16 @@ class OpenAIProxyServer:
         """
         Aggiorna la configurazione runtime senza riavvio.
 
-        Body JSON accettato::
+        Body JSON::
 
             {
-              "model":        "new-model-id",
-              "agent_model":  "override sent per-request",
-              "base_url":     "https://openrouter.ai/api/v1",
-              "llm_api_key":  "sk-or-…",
-              "max_steps":    20,
-              "rate_limit":   60
+              "model":       "google/gemma-3-27b-it:free",
+              "base_url":    "https://openrouter.ai/api/v1",
+              "llm_api_key": "sk-or-…",
+              "max_steps":   20
             }
 
-        Restituisce la configurazione aggiornata.
+        Tutti i campi sono opzionali. Restituisce la config attuale.
         """
         if request.method == "OPTIONS":
             return Response(status_code=204)
@@ -769,52 +806,42 @@ class OpenAIProxyServer:
         if "model" in body:
             new_model = str(body["model"]).strip()
             if new_model:
-                self._current_model = new_model
-                self._config.llm.model = new_model
-                if self._bridge:
-                    self._bridge._config.llm.model = new_model
+                self._current_model             = new_model
+                self._config.llm.model          = new_model
+                self._bridge._config.llm.model  = new_model
                 updated["model"] = new_model
-
-        if "agent_model" in body:
-            agent_model = str(body["agent_model"]).strip()
-            if agent_model:
-                # agent_model is the per-request override — keep it as the resolved model
-                self._current_model = agent_model
-                self._config.llm.model = agent_model
-                if self._bridge:
-                    self._bridge._config.llm.model = agent_model
-                updated["agent_model"] = agent_model
 
         if "base_url" in body:
             new_url = str(body["base_url"]).strip().rstrip("/")
             if new_url:
-                self._config.llm.base_url = new_url
-                if self._bridge:
-                    self._bridge._config.llm.base_url = new_url
+                self._current_base_url              = new_url
+                self._config.llm.base_url           = new_url
+                self._bridge._config.llm.base_url   = new_url
                 updated["base_url"] = new_url
 
         if "llm_api_key" in body:
             new_key = str(body["llm_api_key"]).strip()
             if new_key and hasattr(self._config.llm, "api_key"):
-                self._config.llm.api_key = new_key
-                if self._bridge and hasattr(self._bridge._config.llm, "api_key"):
-                    self._bridge._config.llm.api_key = new_key
+                self._config.llm.api_key             = new_key
+                self._bridge._config.llm.api_key     = new_key
+                
+                # Ricrea il client OpenAI dell'agent con la nuova chiave
+                if self._bridge and self._bridge._agent:
+                    self._bridge._agent._llm_config.api_key = new_key
+                    self._bridge._agent._openai = AsyncOpenAI(
+                        base_url=self._bridge._agent._llm_config.base_url,
+                        api_key=new_key,
+                    )
+                    logger.info("Agent OpenAI client recreated with new API key")
+                
                 updated["llm_api_key"] = "***"
 
         if "max_steps" in body:
             try:
-                new_steps = int(body["max_steps"])
-                if new_steps > 0:
-                    self._max_steps = new_steps
-                    updated["max_steps"] = new_steps
-            except (TypeError, ValueError):
-                pass
-
-        if "rate_limit" in body:
-            try:
-                global _RATE_LIMIT
-                _RATE_LIMIT = max(0, int(body["rate_limit"]))
-                updated["rate_limit"] = _RATE_LIMIT
+                s = int(body["max_steps"])
+                if s > 0:
+                    self._max_steps = s
+                    updated["max_steps"] = s
             except (TypeError, ValueError):
                 pass
 
@@ -822,40 +849,43 @@ class OpenAIProxyServer:
             logger.info("config_updated", extra={"fields": list(updated.keys())})
 
         return JSONResponse({
-            "updated":       updated,
-            "current_model": self._current_model,
-            "base_url":      self._config.llm.base_url,
-            "max_steps":     self._max_steps,
-            "rate_limit":    _RATE_LIMIT,
+            "updated":      updated,
+            "current_model":    self._current_model,
+            "current_base_url": self._current_base_url,
+            "max_steps":    self._max_steps,
         })
 
-    # ── handler: GET + PATCH /v1/tools/state ────────────────────────────────
+    # ── handler: serve webapp static files ────────────────────────────────
 
-    async def _handle_tools_state(self, request: Request) -> JSONResponse:
-        """
-        GET  → restituisce la lista dei tool disabilitati lato server.
-        PATCH → aggiorna la lista; body: ``{"disabled": ["tool_a", "tool_b"]}``
+    def _serve_webapp(self, request: Request) -> HTMLResponse:
+        """Serve the main webapp index.html file."""
+        import os
+        webapp_dir = os.path.join(os.path.dirname(__file__), "webapp")
+        try:
+            with open(os.path.join(webapp_dir, "index.html"), "r") as f:
+                return HTMLResponse(content=f.read())
+        except FileNotFoundError:
+            return HTMLResponse("<h1>Webapp not found</h1>", status_code=404)
 
-        Il client può sincronizzare il proprio stato localStorage con questo endpoint.
-        """
-        if request.method == "OPTIONS":
-            return Response(status_code=204)
+    def _serve_style_css(self, request: Request) -> Response:
+        """Serve the webapp CSS file."""
+        import os
+        webapp_dir = os.path.join(os.path.dirname(__file__), "webapp")
+        try:
+            with open(os.path.join(webapp_dir, "style.css"), "r") as f:
+                return HTMLResponse(content=f.read(), media_type="text/css")
+        except FileNotFoundError:
+            return Response("<h1>Not found</h1>", status_code=404)
 
-        if request.method == "PATCH":
-            try:
-                body: dict[str, Any] = await request.json()
-            except Exception:
-                return _err(400, "Body JSON non valido", "invalid_request_error")
-            disabled = body.get("disabled", [])
-            if not isinstance(disabled, list):
-                return _err(400, "'disabled' deve essere una lista di stringhe", "invalid_request_error")
-            self._disabled_tools = set(str(t) for t in disabled)
-            logger.info("tools_state_updated", extra={"disabled_count": len(self._disabled_tools)})
-
-        return JSONResponse({
-            "disabled": sorted(self._disabled_tools),
-            "disabled_count": len(self._disabled_tools),
-        })
+    def _serve_app_js(self, request: Request) -> Response:
+        """Serve the webapp JavaScript file."""
+        import os
+        webapp_dir = os.path.join(os.path.dirname(__file__), "webapp")
+        try:
+            with open(os.path.join(webapp_dir, "app.js"), "r") as f:
+                return HTMLResponse(content=f.read(), media_type="application/javascript")
+        except FileNotFoundError:
+            return Response("<h1>Not found</h1>", status_code=404)
 
     # ── handler: /v1/status ─────────────────────────────────────────────────
 
@@ -873,10 +903,10 @@ class OpenAIProxyServer:
         return JSONResponse({
             "status":          "ok",
             "uptime_s":        round(time.time() - _metrics.started_at, 1),
-            "llm_backend":     self._config.llm.base_url,
+            "llm_backend":     self._current_base_url,
             "llm_model":       self._current_model,
             "max_steps":       self._max_steps,
-            "auth_enabled":    bool(_API_KEY),
+            "auth_enabled":    self._config.llm.api_key if self._config.llm.api_key else bool(_API_KEY),
             "rate_limit_rpm":  _RATE_LIMIT,
             "cors_origins":    _CORS_ORIGINS,
             "log_format":      _LOG_FORMAT,

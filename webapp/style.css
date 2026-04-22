@@ -688,33 +688,19 @@ input, textarea, button, select {
 
 #tools-server-tabs {
   display: flex;
-  gap: 8px;
+  gap: 6px;
   margin-bottom: 16px;
   flex-wrap: wrap;
   align-items: center;
 }
 
-/* Wrapper that holds the pill button + its toggle side-by-side */
-.server-tab-wrap {
-  display: inline-flex;
-  align-items: center;
-  gap: 0;
+/* plain "All" tab */
+.server-tab-btn {
   background: var(--bg-2);
   border: 1px solid var(--border-2);
   border-radius: 20px;
-  transition: border-color .15s;
-}
-
-.server-tab-wrap:has(.server-tab-btn.active) {
-  border-color: var(--amber);
-}
-
-.server-tab-btn {
-  background: none;
-  border: none;
-  border-radius: 20px 0 0 20px;
   color: var(--text-dim);
-  padding: 4px 12px 4px 14px;
+  padding: 4px 14px;
   cursor: pointer;
   font-family: var(--font-mono);
   font-size: 11px;
@@ -722,73 +708,108 @@ input, textarea, button, select {
   transition: var(--transition);
   white-space: nowrap;
 }
+.server-tab-btn:hover  { border-color: var(--amber-dim); color: var(--text); }
+.server-tab-btn.active { background: var(--amber-glow); border-color: var(--amber); color: var(--amber); }
 
-/* "All" tab has no toggle sibling — keep full rounded corners */
-.server-tab-wrap:first-child .server-tab-btn {
+/* server pill = filter btn + enable toggle */
+.server-tab-wrap {
+  display: inline-flex;
+  align-items: stretch;
+  background: var(--bg-2);
+  border: 1px solid var(--border-2);
   border-radius: 20px;
-  padding: 4px 14px;
+  transition: border-color .15s;
+  overflow: hidden;
 }
-
-.server-tab-btn:hover { color: var(--text); }
-
-.server-tab-btn.active {
-  background: var(--amber-glow);
-  color: var(--amber);
+.server-tab-wrap:focus-within,
+.server-tab-wrap:has(.server-tab-btn.active) { border-color: var(--amber-dim); }
+.server-tab-wrap.all-disabled { opacity: .5; }
+.server-tab-wrap .server-tab-btn {
+  background: none;
+  border: none;
+  border-radius: 0;
+  padding: 4px 10px 4px 14px;
 }
+.server-tab-wrap .server-tab-btn.active { background: var(--amber-glow); }
 
-/* Pill goes dim but stays visible when server is fully disabled */
-.server-tab-btn.server-all-disabled {
-  color: var(--muted);
-  text-decoration: line-through;
-  text-decoration-color: var(--muted);
-}
-
-/* ── Server-level enable/disable toggle ─────────────────────────── */
-.server-toggle {
+/* server-level toggle */
+.srv-toggle {
   display: inline-flex;
   align-items: center;
-  cursor: pointer;
-  padding: 4px 10px 4px 6px;
+  padding: 0 10px 0 6px;
   border-left: 1px solid var(--border-2);
-  border-radius: 0 20px 20px 0;
+  cursor: pointer;
   transition: background .15s;
 }
-
-.server-toggle:hover {
-  background: var(--bg-3);
-}
-
-.server-toggle input { display: none; }
-
-.server-toggle-track {
-  width: 24px;
-  height: 12px;
+.srv-toggle:hover { background: var(--bg-3); }
+.srv-toggle-inp   { display: none; }
+.srv-toggle-track {
+  width: 22px; height: 11px;
   background: var(--border-2);
   border-radius: 6px;
   position: relative;
   transition: background .2s;
-  flex-shrink: 0;
 }
-
-.server-toggle-track::after {
+.srv-toggle-track::after {
   content: '';
   position: absolute;
-  top: 2px;
-  left: 2px;
-  width: 8px;
-  height: 8px;
+  top: 2px; left: 2px;
+  width: 7px; height: 7px;
   border-radius: 50%;
   background: var(--muted);
   transition: var(--transition);
 }
+.srv-toggle-inp:checked ~ .srv-toggle-track              { background: rgba(240,160,0,.3); }
+.srv-toggle-inp:checked ~ .srv-toggle-track::after       { left: 13px; background: var(--amber); }
 
-.server-toggle input:checked ~ .server-toggle-track {
-  background: rgba(240,160,0,.3);
+/* disabled badge in Tools header */
+.disabled-badge {
+  background: rgba(255,77,77,.1);
+  border: 1px solid rgba(255,77,77,.3);
+  border-radius: 10px;
+  color: var(--red);
+  font-size: 10px;
+  padding: 2px 10px;
+  letter-spacing: .04em;
 }
 
-.server-toggle input:checked ~ .server-toggle-track::after {
-  left: 14px;
-  background: var(--amber);
+/* per-tool enable toggle inside card header */
+.tool-card-toggle {
+  display: inline-flex;
+  align-items: center;
+  cursor: pointer;
+  padding: 4px 6px;
+  border-radius: var(--radius);
+  flex-shrink: 0;
+  margin-right: 4px;
+}
+.tool-card-toggle:hover { background: var(--bg-3); }
+.tool-card-toggle input { display: none; }
+.tool-card-toggle-track {
+  width: 24px; height: 12px;
+  background: var(--border-2);
+  border-radius: 6px;
+  position: relative;
+  transition: background .2s;
+}
+.tool-card-toggle-track::after {
+  content: '';
+  position: absolute;
+  top: 2px; left: 2px;
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  background: var(--muted);
+  transition: var(--transition);
+}
+.tool-card-toggle input:checked ~ .tool-card-toggle-track              { background: rgba(240,160,0,.25); }
+.tool-card-toggle input:checked ~ .tool-card-toggle-track::after       { left: 14px; background: var(--amber); }
+
+/* disabled tool card */
+.tool-card.tool-disabled { opacity: .35; }
+.tool-card.tool-disabled .tool-card-name {
+  color: var(--muted-2);
+  text-decoration: line-through;
+  text-decoration-color: var(--muted);
 }
 
 
@@ -922,7 +943,7 @@ canvas { display: block; width: 100% !important; }
 
 /* ── Settings ───────────────────────────────────────────────────── */
 .settings-form {
-  max-width: 640px;
+  max-width: 600px;
   display: flex;
   flex-direction: column;
   gap: 28px;
@@ -943,34 +964,12 @@ canvas { display: block; width: 100% !important; }
 
 .field { display: flex; flex-direction: column; gap: 6px; }
 
-/* Two fields side by side */
-.field-row {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 14px;
-}
-
-@media (max-width: 560px) {
-  .field-row { grid-template-columns: 1fr; }
-}
-
 .field label {
   font-size: 11px;
   font-weight: 500;
   letter-spacing: .05em;
   color: var(--text-dim);
   text-transform: uppercase;
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}
-
-.field-optional {
-  font-weight: 400;
-  letter-spacing: 0;
-  text-transform: none;
-  font-size: 10px;
-  color: var(--muted);
 }
 
 .field input[type="text"],
@@ -1000,16 +999,6 @@ canvas { display: block; width: 100% !important; }
   color: var(--amber-bright);
 }
 
-/* Skills read-only pill list */
-.skills-readonly-list {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  min-height: 26px;
-  align-items: center;
-  padding: 6px 0;
-}
-
 .input-row {
   display: flex;
   gap: 8px;
@@ -1021,6 +1010,14 @@ canvas { display: block; width: 100% !important; }
   display: flex;
   align-items: center;
   gap: 12px;
+}
+
+.field-opt {
+  font-weight: 400;
+  letter-spacing: 0;
+  text-transform: none;
+  font-size: 10px;
+  color: var(--muted);
 }
 
 .saved-msg {
@@ -1073,77 +1070,7 @@ canvas { display: block; width: 100% !important; }
   to   { opacity: 1; transform: translateX(0); }
 }
 
-/* ── Tool enable toggle (per-card function-call switch) ─────────── */
-.tool-enable-toggle {
-  display: inline-flex;
-  align-items: center;
-  cursor: pointer;
-  flex-shrink: 0;
-  margin-right: 8px;
-  padding: 4px;
-  border-radius: var(--radius);
-}
-
-.tool-enable-toggle input { display: none; }
-
-.tool-toggle-track {
-  width: 26px;
-  height: 13px;
-  background: var(--border-2);
-  border-radius: 7px;
-  position: relative;
-  transition: background .2s;
-  border: 1px solid var(--border-2);
-}
-
-.tool-toggle-track::after {
-  content: '';
-  position: absolute;
-  top: 2px;
-  left: 2px;
-  width: 7px;
-  height: 7px;
-  background: var(--muted);
-  border-radius: 50%;
-  transition: var(--transition);
-}
-
-.tool-enable-toggle input:checked ~ .tool-toggle-track {
-  background: rgba(240,160,0,.25);
-  border-color: var(--amber-dim);
-}
-
-.tool-enable-toggle input:checked ~ .tool-toggle-track::after {
-  left: 15px;
-  background: var(--amber);
-}
-
-.tool-enable-toggle:hover .tool-toggle-track {
-  border-color: var(--amber-dim);
-}
-
-/* tool card dimmed when disabled */
-.tool-card.tool-disabled {
-  opacity: .38;
-}
-.tool-card.tool-disabled .tool-card-name {
-  color: var(--muted-2);
-  text-decoration: line-through;
-  text-decoration-color: var(--muted);
-}
-
-/* badge showing how many tools are disabled */
-.disabled-badge {
-  background: rgba(255,77,77,.12);
-  border: 1px solid rgba(255,77,77,.3);
-  border-radius: 10px;
-  color: var(--red);
-  font-size: 10px;
-  padding: 2px 10px;
-  letter-spacing: .04em;
-}
-
-
+/* ── Responsive ─────────────────────────────────────────────────── */
 @media (max-width: 900px) {
   .grid-4 { grid-template-columns: 1fr 1fr; }
   .two-col { grid-template-columns: 1fr; }

@@ -35,8 +35,10 @@ from typing import Any, AsyncIterator, Callable
 
 from openai import AsyncOpenAI
 from openai.types.chat import ChatCompletionMessageParam
+from openai._exceptions import AuthenticationError as OpenAIAuthenticationError, RateLimitError as OpenAIRateLimitError
 
 from client import MCPClient
+from exceptions import AuthenticationError, RateLimitError, ModelNotFoundError
 from config import LLMConfig
 from registry import ToolRegistry, mcp_result_to_string
 from skills import SkillRegistry
@@ -127,6 +129,22 @@ class MCPAgent:
 
         # Strumenti nel formato OpenAI (calcolati una volta sola)
         self._openai_tools = registry.to_openai_tools(use_qualified_names)
+
+    # ── update runtime config ─────────────────────────────────────────────────
+
+    def update_base_url(self, new_base_url: str) -> None:
+        """
+        Aggiorna il base_url del client OpenAI senza ricreare l'agent.
+        Deve essere chiamato quando il server riceve un nuovo base_url dalla richiesta.
+        """
+        if new_base_url and new_base_url != self._llm_config.base_url:
+            logger.info("Updating agent LLM base_url", extra={"new_url": new_base_url})
+            self._llm_config.base_url = new_base_url
+            # Ricrea il client OpenAI con il nuovo URL
+            self._openai = AsyncOpenAI(
+                base_url=new_base_url,
+                api_key=self._llm_config.api_key,
+            )
 
     # ── proprietà ─────────────────────────────────────────────────────────────
 
@@ -343,6 +361,20 @@ class MCPAgent:
         return messages
 
     async def _call_llm(self, messages: list[ChatCompletionMessageParam]):
+        """
+        Chiama l'API LLM con gestione errori robusta.
+        
+        Raises
+        ------
+        AuthenticationError
+            Se la richiesta fallisce con 401 Unauthorized.
+        RateLimitError
+            Se la richiesta fallisce con 429 Too Many Requests.
+        ModelNotFoundError
+            Se il modello specificato non esiste.
+        Exception
+            Qualsiasi altro errore imprevisto.
+        """
         kwargs: dict[str, Any] = {
             "model":       self._llm_config.model,
             "messages":    messages,
@@ -353,7 +385,60 @@ class MCPAgent:
             kwargs["tools"]       = self._openai_tools
             # kwargs["tool_choice"] = "auto"
 
-        return await self._openai.chat.completions.create(**kwargs)
+        try:
+            return await self._openai.chat.completions.create(**kwargs)
+        except OpenAIAuthenticationError as e:
+            # Estrae informazioni dal provider se possibile
+            provider = "unknown"
+            if hasattr(self._llm_config, 'base_url'):
+                base_url = self._llm_config.base_url or ""
+                if "openrouter" in base_url:
+                    provider = "openrouter"
+                elif "inclusionai" in base_url:
+                    provider = "inclusionai"
+                elif "sambanova" in base_url:
+                    provider = "sambanova"
+            
+            logger.error(
+                "Authentication error calling LLM",
+                extra={"provider": provider, "model": self._llm_config.model},
+            )
+            raise AuthenticationError(
+                message=str(e),
+                provider=provider,
+                suggestion=f"Verifica la chiave API per {provider}. Controlla LLM_API_KEY nel file .env",
+            )
+        except OpenAIRateLimitError as e:
+            retry_after = None
+            if hasattr(e, 'retry_after'):
+                retry_after = int(e.retry_after) if e.retry_after else None
+            
+            logger.warning(
+                "Rate limit hit calling LLM",
+                extra={"provider": provider, "retry_after": retry_after},
+            )
+            raise RateLimitError(
+                message=str(e),
+                retry_after=retry_after,
+            )
+        except Exception as e:
+            # Cattura errori generici (inclusi 404 per modelli non trovati)
+            error_str = str(e).lower()
+            if "model" in error_str and ("not found" in error_str or "does not exist" in error_str):
+                logger.error(
+                    "Model not found",
+                    extra={"model": self._llm_config.model},
+                )
+                raise ModelNotFoundError(
+                    model=self._llm_config.model,
+                ) from e
+            
+            # Ri-lancia altri errori non gestiti
+            logger.error(
+                "Unexpected LLM error",
+                extra={"error_type": type(e).__name__, "model": self._llm_config.model},
+            )
+            raise
 
     async def _execute_tool_call(self, tc) -> str:
         """Esegue un singolo tool call e restituisce il risultato come stringa."""
