@@ -48,7 +48,7 @@ class LLMConfig:
     api_key: str
     model: str
     temperature: float
-    max_tokens: int
+    max_tokens: int = 0
 
 
 @dataclass
